@@ -22,8 +22,16 @@ import { approvedRequestUpdate, customerRequestTypes, requestEligibility, reques
 const app = express();
 
 app.use(helmet());
+const allowedOrigins = new Set(
+  (process.env.CLIENT_ORIGIN || '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean)
+);
+allowedOrigins.add('http://localhost:5173');
+allowedOrigins.add('http://127.0.0.1:5173');
 app.use(cors({
-  origin: process.env.CLIENT_ORIGIN?.split(',') ?? 'http://localhost:5173'
+  origin: (origin, callback) => callback(null, !origin || allowedOrigins.has(origin))
 }));
 app.use(express.json({ limit: '1mb' }));
 app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, limit: 50, standardHeaders: true, legacyHeaders: false }));
@@ -932,7 +940,7 @@ async function startServer() {
       listeningServer.once('error', reject);
     });
 
-    console.log(`SubSight API running on http://127.0.0.1:${PORT}`);
+    console.log(`SubSight API listening on port ${PORT}`);
 
     cron.schedule('0 2 * * *', async () => {
       try {

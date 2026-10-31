@@ -1,6 +1,10 @@
 import axios from 'axios';
 
-const api = axios.create({ baseURL: '/api', timeout: 15000 });
+const configuredApiUrl = import.meta.env.VITE_API_URL?.trim().replace(/\/+$/, '');
+const apiBaseURL = configuredApiUrl
+  ? `${configuredApiUrl}${configuredApiUrl.endsWith('/api') ? '' : '/api'}`
+  : '/api';
+const api = axios.create({ baseURL: apiBaseURL, timeout: 15000 });
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem('subsight-token');
   if (token) config.headers.Authorization = `Bearer ${token}`;
