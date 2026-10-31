@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { addPeriod, escapeSearch, makeNumber, pageResult, passwordValid, quantityFor } from './utils.js';
+import { prepareLocalConfig } from './config/localSetup.js';
+import { csvCell, reportRange } from './reporting.js';
 import { approvedRequestUpdate, requestEligibility, requestResponseMessage } from './subscriptionRequests.js';
 import { Subscription } from './models.js';
 
@@ -53,6 +55,32 @@ test('catalog searches treat regex characters as literal text', () => {
     assert.equal(search.test(value), true);
     assert.equal(search.test('unrelated'), false);
   }
+});
+
+test('local setup creates private random credentials and keeps valid existing configuration', () => {
+  const template = 'MONGODB_URI=mongodb://127.0.0.1:27017/subsight\nJWT_SECRET=replace-with-secret\nADMIN_EMAIL=admin@example.test\nADMIN_PASSWORD=\n';
+  const first = prepareLocalConfig(template);
+  assert.ok(first.config.JWT_SECRET.length >= 32);
+  assert.equal(passwordValid(first.config.ADMIN_PASSWORD), true);
+  const second = prepareLocalConfig(template, first.content);
+  assert.equal(second.content, first.content);
+  const third = prepareLocalConfig(template);
+  assert.notEqual(first.config.JWT_SECRET, third.config.JWT_SECRET);
+  assert.notEqual(first.config.ADMIN_PASSWORD, third.config.ADMIN_PASSWORD);
+});
+
+test('CSV escapes spreadsheet formulas, quotes and separators', () => {
+  assert.equal(csvCell('=SUM(1,2)'), '"\'=SUM(1,2)"');
+  assert.equal(csvCell('A "quoted", value'), '"A ""quoted"", value"');
+  assert.equal(csvCell(null), '""');
+  assert.equal(csvCell('  =SUM(1,2)'), '"\'  =SUM(1,2)"');
+});
+
+test('report dates include the selected final day in Indian time', () => {
+  const range = reportRange({ from: '2026-10-31', to: '2026-10-31' });
+  assert.equal(range.$gte.toISOString(), '2026-10-30T18:30:00.000Z');
+  assert.equal(range.$lt.toISOString(), '2026-10-31T18:30:00.000Z');
+  assert.throws(() => reportRange({ from: '2026-02-31' }), { status: 400 });
 });
 
 test('pause requests require an eligible active subscription and plan', () => {

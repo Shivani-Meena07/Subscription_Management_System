@@ -9,6 +9,7 @@ const months = Array.from({ length: 6 }, (_, i) => {
   return d.toLocaleString('en-IN', { month: 'short' });
 });
 const bars = [38, 52, 46, 64, 58, 82];
+const currentYear = new Date().getFullYear();
 
 const features = [
   { Icon: Users, title: 'Customers', text: 'Every account, plan and seat count in one place.', more: 'Search customers, see their plans and deactivate accounts without leaving the list.' },
@@ -17,11 +18,11 @@ const features = [
 ];
 
 export default function Landing({ onGetStarted, onSignIn }) {
-  const [stage, setStage] = useState(0); // 0 chart, 1 paper crumples, 2 dashboard
+  const [stage, setStage] = useState(() => window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 2 : 0);
   const [open, setOpen] = useState(null);
 
   useEffect(() => {
-    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) { setStage(2); return undefined; }
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return undefined;
     const a = setTimeout(() => setStage(1), 3400);
     const b = setTimeout(() => setStage(2), 4800);
     return () => { clearTimeout(a); clearTimeout(b); };
@@ -109,7 +110,7 @@ export default function Landing({ onGetStarted, onSignIn }) {
         ))}
       </section>
 
-      <footer className="landing-footer">© {new Date().getFullYear()} Brightloop Software. Built for recurring business.</footer>
+      <footer className="landing-footer">© {currentYear} Brightloop Software. Built for recurring business.</footer>
     </div>
   );
 }

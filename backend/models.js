@@ -9,6 +9,9 @@ const userSchema = new Schema({
   password: { type: String, required: true, select: false },
   role: { type: String, enum: ['admin', 'staff', 'customer'], default: 'customer' },
   active: { type: Boolean, default: true },
+  company: { type: String, trim: true, default: '' },
+  phone: { type: String, trim: true, default: '' },
+  address: { type: String, trim: true, default: '' },
   resetToken: { type: String, select: false },
   resetExpires: { type: Date, select: false },
   tokenVersion: { type: Number, default: 0, select: false }
@@ -108,9 +111,19 @@ const invoiceSchema = new Schema({
   outstanding: { type: Number, min: 0, required: true },
   invoiceDate: { type: Date, default: Date.now },
   dueDate: { type: Date, required: true, index: true },
-  status: { type: String, enum: ['draft', 'confirmed', 'partial', 'paid', 'cancelled'], default: 'confirmed', index: true }
+  status: { type: String, enum: ['draft', 'confirmed', 'partial', 'paid', 'cancelled'], default: 'confirmed', index: true },
+  paymentEntries: [{
+    requestKey: { type: String, required: true },
+    amount: { type: Number, min: 0.01, required: true },
+    method: { type: String, enum: ['cash', 'bank transfer', 'upi', 'card', 'other'], required: true },
+    reference: String,
+    notes: String,
+    paidAt: { type: Date, required: true },
+    synced: { type: Boolean, default: false }
+  }]
 }, { timestamps: true });
 invoiceSchema.index({ subscription: 1, billingPeriodStart: 1, billingPeriodEnd: 1 }, { unique: true, sparse: true });
+invoiceSchema.index({ 'paymentEntries.requestKey': 1 }, { unique: true, partialFilterExpression: { 'paymentEntries.requestKey': { $type: 'string' } } });
 
 const paymentSchema = new Schema({
   customer: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
@@ -147,3 +160,11 @@ export const Invoice = model('Invoice', invoiceSchema);
 export const Payment = model('Payment', paymentSchema);
 export const Tax = model('Tax', taxSchema);
 export const Discount = model('Discount', discountSchema);
+
+export const AuditEvent = model('AuditEvent', new Schema({
+  actor: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  action: { type: String, required: true },
+  resource: { type: String, required: true },
+  recordId: String,
+  occurredAt: { type: Date, default: Date.now, index: true }
+}));

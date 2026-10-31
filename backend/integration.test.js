@@ -6,7 +6,8 @@ import mongoose from 'mongoose';
 import jwt from 'jsonwebtoken';
 import { app, generateDueInvoices } from './server.js';
 import { Discount, Invoice, Payment, Plan, Product, Quotation, Subscription, Tax, User } from './models.js';
-import { recordPayment } from './payments.js';
+import { recordPayment, syncPaymentHistory } from './payments.js';
+import { flushAudit } from './audit.js';
 
 describe('backend API with an isolated MongoDB database', { skip: !process.env.TEST_MONGODB_URI }, () => {
   const databaseName = `subsight_test_${randomUUID().replaceAll('-', '')}`;
@@ -54,6 +55,7 @@ describe('backend API with an isolated MongoDB database', { skip: !process.env.T
   });
 
   beforeEach(async () => {
+    await flushAudit();
     await Promise.all(Object.values(mongoose.models).map((Model) => Model.deleteMany({})));
     [admin, staff, customer] = await User.create([
       { name: 'Test Admin', email: 'admin@example.test', password, role: 'admin' },
@@ -67,6 +69,7 @@ describe('backend API with an isolated MongoDB database', { skip: !process.env.T
 
   after(async () => {
     if (server) await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await flushAudit();
     if (mongoose.connection.readyState === 1 && mongoose.connection.name === databaseName) await mongoose.connection.dropDatabase();
     await mongoose.disconnect();
   });
@@ -133,7 +136,8 @@ describe('backend API with an isolated MongoDB database', { skip: !process.env.T
     assert.equal(approved.body.item.status, 'paused');
     assert.equal(approved.body.request.status, 'approved');
     assert.ok(approved.body.request.reviewedAt);
-    assert.equal(String(approved.body.request.reviewedBy), staff.id);
+    assert.equal(approved.body.request.reviewedBy._id, staff.id);
+    assert.equal(approved.body.request.reviewedBy.name, staff.name);
     assert.equal((await call('PATCH', path, { status: 'approved' }, adminToken)).status, 409);
   });
 
@@ -247,14 +251,20 @@ describe('backend API with an isolated MongoDB database', { skip: !process.env.T
     assert.equal((await call('PATCH', `/invoices/${invoice.id}/status`, { status: 'confirmed' })).status, 400);
   });
 
-  test('a failed payment record restores the invoice balance and status', async (context) => {
+  test('a failed payment history write retains a durable payment and can be recovered', async (context) => {
     const invoice = await invoiceFor();
-    context.mock.method(Payment, 'create', async () => { throw new Error('Payment write failed'); });
-    await assert.rejects(recordPayment({ invoice: invoice.id, amount: 40, method: 'upi' }), /Payment write failed/);
+    const create = context.mock.method(Payment, 'create', async () => { throw new Error('Payment write failed'); });
+    const result = await recordPayment({ invoice: invoice.id, amount: 40, method: 'upi' });
+    assert.equal(result.pending, true);
     const saved = await Invoice.findById(invoice._id);
-    assert.equal(saved.paidAmount, 0);
-    assert.equal(saved.outstanding, 100);
-    assert.equal(saved.status, 'confirmed');
+    assert.equal(saved.paidAmount, 40);
+    assert.equal(saved.outstanding, 60);
+    assert.equal(saved.status, 'partial');
+    assert.equal(saved.paymentEntries.length, 1);
+    create.mock.restore();
+    assert.equal((await syncPaymentHistory()).synced, 1);
+    assert.equal(await Payment.countDocuments(), 1);
+    assert.equal((await Invoice.findById(invoice._id)).paidAmount, 40);
   });
 
   test('simultaneous payments cannot exceed the remaining invoice balance', async () => {
@@ -267,12 +277,12 @@ describe('backend API with an isolated MongoDB database', { skip: !process.env.T
     assert.equal(await Payment.countDocuments(), 1);
   });
 
-  test('payment rollback preserves a different successful concurrent payment', async (context) => {
+  test('a failed history write cannot undo a different successful concurrent payment', async (context) => {
     const invoice = await invoiceFor();
     const create = Payment.create.bind(Payment);
     let finishSuccessfulPayment;
     const successfulPayment = new Promise((resolve) => { finishSuccessfulPayment = resolve; });
-    context.mock.method(Payment, 'create', async (data) => {
+    const mockedCreate = context.mock.method(Payment, 'create', async (data) => {
       if (data.amount === 30) {
         await successfulPayment;
         throw new Error('Payment write failed');
@@ -284,12 +294,15 @@ describe('backend API with an isolated MongoDB database', { skip: !process.env.T
     const results = await Promise.allSettled([
       recordPayment({ invoice: invoice.id, amount: 30 }), recordPayment({ invoice: invoice.id, amount: 70 })
     ]);
-    assert.deepEqual(results.map((result) => result.status), ['rejected', 'fulfilled']);
+    assert.deepEqual(results.map((result) => result.status), ['fulfilled', 'fulfilled']);
     const saved = await Invoice.findById(invoice._id);
-    assert.equal(saved.paidAmount, 70);
-    assert.equal(saved.outstanding, 30);
-    assert.equal(saved.status, 'partial');
+    assert.equal(saved.paidAmount, 100);
+    assert.equal(saved.outstanding, 0);
+    assert.equal(saved.status, 'paid');
     assert.equal(await Payment.countDocuments(), 1);
+    mockedCreate.mock.restore();
+    assert.equal((await syncPaymentHistory()).synced, 1);
+    assert.equal(await Payment.countDocuments(), 2);
   });
 
   test('simultaneous payment and cancellation cannot leave a cancelled paid invoice', async () => {
@@ -395,6 +408,150 @@ describe('backend API with an isolated MongoDB database', { skip: !process.env.T
     await invoice.save();
     assert.equal((await call('GET', `/invoices/${invoice.id}`, undefined, customerToken)).status, 404);
     assert.equal((await call('POST', '/payments', { invoice: invoice.id, amount: 1 }, customerToken)).status, 403);
+  });
+
+  test('payment request keys make simultaneous retries safe and reject changed details', async () => {
+    const invoice = await invoiceFor();
+    const data = { invoice: invoice.id, amount: 40, requestKey: 'same-payment-request' };
+    const results = await Promise.all([call('POST', '/payments', data), call('POST', '/payments', data)]);
+    assert.deepEqual(results.map((result) => result.status), [201, 201]);
+    assert.equal(await Payment.countDocuments(), 1);
+    assert.equal((await Invoice.findById(invoice._id)).paidAmount, 40);
+    assert.equal((await call('POST', '/payments', { ...data, amount: 50 })).status, 409);
+    const other = await invoiceFor();
+    assert.equal((await call('POST', '/payments', { ...data, invoice: other.id })).status, 409);
+    assert.equal((await Invoice.findById(other._id)).paidAmount, 0);
+  });
+
+  test('a failed atomic invoice write cannot create a payment history record', async (context) => {
+    const invoice = await invoiceFor();
+    context.mock.method(Invoice, 'findOneAndUpdate', async () => { throw new Error('Invoice write failed'); });
+    await assert.rejects(recordPayment({ invoice: invoice.id, amount: 40 }), /Invoice write failed/);
+    assert.equal(await Payment.countDocuments(), 0);
+    assert.equal((await Invoice.findById(invoice._id)).paidAmount, 0);
+  });
+
+  test('customer management creates login accounts that can subscribe and keeps financial history', async () => {
+    const created = await call('POST', '/customers', {
+      name: 'Managed Customer', email: 'managed@example.test', password, company: 'Example Ltd', role: 'admin'
+    }, staffToken);
+    assert.equal(created.status, 201);
+    assert.equal(created.body.item.role, 'customer');
+    assert.equal('password' in created.body.item, false);
+    const login = await call('POST', '/auth/login', { email: 'managed@example.test', password }, null);
+    assert.equal(login.status, 200);
+    const plan = await planFor();
+    assert.equal((await call('POST', '/portal/subscriptions', { plan: plan.id, quantity: 1 }, login.body.token)).status, 201);
+    assert.equal((await call('PATCH', '/customers/' + created.body.item._id, { company: 'Updated Ltd', role: 'admin' })).status, 200);
+    assert.equal((await User.findById(created.body.item._id)).role, 'customer');
+    assert.equal((await call('DELETE', '/customers/' + created.body.item._id)).status, 200);
+    assert.equal(await Subscription.countDocuments({ customer: created.body.item._id }), 1);
+    assert.equal((await call('GET', '/auth/me', undefined, login.body.token)).status, 401);
+    assert.equal((await call('GET', '/customers', undefined, customerToken)).status, 403);
+  });
+
+  test('catalog editing validates promotional rules and preserves internal usage counters', async () => {
+    assert.equal((await call('POST', '/discounts', { name: 'Invalid promo', kind: 'percentage', value: 150 })).status, 400);
+    const discount = await call('POST', '/discounts', { name: 'Welcome', kind: 'percentage', value: 10, usageCount: 999 });
+    assert.equal(discount.status, 201);
+    assert.equal(discount.body.item.usageCount, 0);
+    assert.equal((await call('PATCH', '/discounts/' + discount.body.item._id, { value: 200 })).status, 400);
+    assert.equal((await call('PATCH', '/discounts/' + discount.body.item._id, { value: 20 })).status, 200);
+    assert.equal((await call('POST', '/plans', { name: 'Bad dates', price: 100, startDate: '2026-12-01', endDate: '2026-01-01' })).status, 400);
+    assert.equal((await call('POST', '/products', { name: 'Forbidden', salesPrice: 10 }, staffToken)).status, 403);
+  });
+
+  test('reports and CSV exports use actual payments, date ranges and safe customer text', async () => {
+    const invoice = await invoiceFor();
+    await call('POST', '/payments', { invoice: invoice.id, amount: 40 });
+    const report = await call('GET', '/reports/summary');
+    assert.equal(report.status, 200);
+    assert.equal(report.body.metrics.revenue, 40);
+    assert.equal(report.body.metrics.invoiced, 100);
+    assert.equal(report.body.metrics.outstanding, 60);
+    assert.equal(report.body.topCustomers[0].name, customer.name);
+    assert.equal((await call('GET', '/reports/summary?from=2026-02-31')).status, 400);
+    assert.equal((await call('GET', '/reports/summary?from=2026-12-31&to=2026-01-01')).status, 400);
+    assert.equal((await call('GET', '/reports/summary', undefined, customerToken)).status, 403);
+    await User.updateOne({ _id: customer._id }, { $set: { name: '=SUM(1,2)' } });
+    for (const kind of ['invoices', 'payments']) {
+      const response = await fetch(baseUrl + '/api/reports/export?kind=' + kind, { headers: { Authorization: 'Bearer ' + adminToken } });
+      assert.equal(response.status, 200);
+      assert.match(response.headers.get('content-type'), /text\/csv/);
+      const csv = await response.text();
+      assert.ok(csv.includes(invoice.number));
+      assert.ok(csv.includes("'=SUM(1,2)"));
+    }
+  });
+
+  test('audit history records actors without secrets and consistency checks find ledger mismatches', async () => {
+    const product = await call('POST', '/products', { name: 'Audited product', salesPrice: 100 });
+    assert.equal(product.status, 201);
+    const events = await call('GET', '/audit/events');
+    assert.equal(events.status, 200);
+    assert.equal(events.body.items[0].actor.name, admin.name);
+    assert.equal(events.body.items[0].action, 'POST /api/products');
+    assert.equal(events.body.items[0].recordId, product.body.item._id);
+    assert.equal(JSON.stringify(events.body).includes(password), false);
+    const invoice = await invoiceFor();
+    await call('POST', '/payments', { invoice: invoice.id, amount: 40 });
+    assert.equal((await call('GET', '/audit/checks')).body.issueCount, 0);
+    await Invoice.updateOne({ _id: invoice._id }, { $set: { paidAmount: 50, outstanding: 50 } });
+    const checks = await call('GET', '/audit/checks');
+    assert.equal(checks.body.issueCount, 1);
+    assert.equal(checks.body.issues[0].recorded, 40);
+    assert.equal((await call('GET', '/audit/events', undefined, customerToken)).status, 403);
+  });
+
+  test('quotation documents expose printable customer and line-item details', async () => {
+    const quote = await call('POST', '/quotations', { customer: customer.id, items: [{ description: 'Consulting', unitPrice: 50, quantity: 2 }] });
+    const detail = await call('GET', '/quotations/' + quote.body.item._id);
+    assert.equal(detail.status, 200);
+    assert.equal(detail.body.item.total, 100);
+    assert.equal(detail.body.item.customer.email, customer.email);
+    assert.equal((await call('GET', '/quotations/' + quote.body.item._id, undefined, customerToken)).status, 403);
+  });
+
+  test('renewal advances an old expiry and resuming skips paused billing dates', async () => {
+    const subscription = await subscriptionFor({ status: 'closed', expiryDate: new Date(Date.now() - 86400000) });
+    const renewed = await call('PATCH', '/subscriptions/' + subscription.id + '/action', { action: 'renew' });
+    assert.equal(renewed.status, 200);
+    assert.ok(new Date(renewed.body.item.expiryDate) > new Date());
+    await Subscription.updateOne({ _id: subscription._id }, { $set: { status: 'paused', nextBillingDate: new Date(Date.now() - 86400000) } });
+    const before = new Date();
+    const resumed = await call('PATCH', '/subscriptions/' + subscription.id + '/action', { action: 'resume' });
+    assert.equal(resumed.status, 200);
+    assert.ok(new Date(resumed.body.item.nextBillingDate) >= before);
+  });
+
+  test('one billing run catches up missed periods without generating duplicates', async () => {
+    const overdue = new Date();
+    overdue.setDate(overdue.getDate() - 3);
+    overdue.setHours(0, 0, 0, 0);
+    const subscription = await subscriptionFor({ frequency: 'daily', nextBillingDate: overdue });
+    const result = await generateDueInvoices();
+    assert.equal(result.created, 4);
+    assert.equal(result.remaining, 0);
+    assert.equal(await Invoice.countDocuments({ subscription: subscription._id }), 4);
+    assert.equal((await generateDueInvoices()).created, 0);
+  });
+
+  test('API pagination stays stable when catalogue records have equal timestamps', async () => {
+    const createdAt = new Date();
+    await Product.insertMany(Array.from({ length: 120 }, (_, index) => ({ name: 'Page product ' + index, salesPrice: index, createdAt })));
+    const first = await call('GET', '/products?page=1&limit=100');
+    const second = await call('GET', '/products?page=2&limit=100');
+    assert.equal(first.body.pages, 2);
+    assert.equal(first.body.items.length, 100);
+    assert.equal(second.body.items.length, 20);
+    assert.equal(new Set([...first.body.items, ...second.body.items].map((item) => item._id)).size, 120);
+  });
+
+  test('JWT subjects are validated and permissions use database roles rather than token role claims', async () => {
+    const invalid = jwt.sign({ sub: 'not-an-id' }, process.env.JWT_SECRET);
+    assert.equal((await call('GET', '/auth/me', undefined, invalid)).status, 401);
+    const customerClaimingAdmin = jwt.sign({ sub: customer.id, role: 'admin', ver: 0 }, process.env.JWT_SECRET);
+    assert.equal((await call('GET', '/reports/summary', undefined, customerClaimingAdmin)).status, 403);
   });
 
   test('expired password reset tokens cannot change a password or delete the user', async () => {

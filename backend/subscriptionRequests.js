@@ -1,3 +1,5 @@
+import { addPeriod } from './utils.js';
+
 export const customerRequestTypes = ['pause', 'cancel', 'renew'];
 
 export function requestEligibility(subscription, type, now = new Date(), stage = 'submit') {
@@ -17,6 +19,8 @@ export function requestEligibility(subscription, type, now = new Date(), stage =
   }
 
   if (type === 'renew') {
+    if (plan.active === false) return 'The subscription plan is inactive.';
+    if (plan.startDate && now < plan.startDate || plan.endDate && now > plan.endDate) return 'The plan is outside its availability dates.';
     if (!plan.allowRenewal) return 'Renewal is not allowed for this plan.';
     if (!['closed', 'expired'].includes(subscription.status)) return 'Only closed or expired subscriptions can be renewed.';
   }
@@ -29,7 +33,7 @@ export function approvedRequestUpdate(subscription, type, now = new Date()) {
   if (error) return { error };
   if (type === 'pause') return { update: { status: 'paused' } };
   if (type === 'cancel') return { update: { status: 'closed' } };
-  return { update: { status: 'active', nextBillingDate: now } };
+  return { update: { status: 'active', nextBillingDate: now, ...(subscription.expiryDate ? { expiryDate: addPeriod(now, subscription.frequency || subscription.plan.frequency || 'monthly') } : {}) } };
 }
 
 export function requestResponseMessage(type) {
