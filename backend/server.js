@@ -928,7 +928,7 @@ async function startServer() {
     await connectDB();
 
     await new Promise((resolve, reject) => {
-      const listeningServer = app.listen(PORT, '127.0.0.1', () => resolve(listeningServer));
+      const listeningServer = app.listen(PORT, '0.0.0.0', () => resolve(listeningServer));
       listeningServer.once('error', reject);
     });
 
