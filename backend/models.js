@@ -9,8 +9,9 @@ const userSchema = new Schema({
   password: { type: String, required: true, select: false },
   role: { type: String, enum: ['admin', 'staff', 'customer'], default: 'customer' },
   active: { type: Boolean, default: true },
-  resetToken: String,
-  resetExpires: Date
+  resetToken: { type: String, select: false },
+  resetExpires: { type: Date, select: false },
+  tokenVersion: { type: Number, default: 0, select: false }
 }, { timestamps: true });
 userSchema.pre('save', async function () {
   if (this.isModified('password')) this.password = await bcrypt.hash(this.password, 12);
@@ -32,7 +33,7 @@ const planSchema = new Schema({
   description: String,
   price: { type: Number, min: 0, required: true },
   frequency: { type: String, enum: ['daily', 'weekly', 'monthly', 'yearly'], default: 'monthly' },
-  minimumQuantity: { type: Number, min: 1, default: 1 },
+  minimumQuantity: { type: Number, min: 1, default: 1, validate: Number.isSafeInteger },
   products: [{ type: Schema.Types.ObjectId, ref: 'Product' }],
   startDate: Date,
   endDate: Date,
@@ -47,9 +48,9 @@ const itemSchema = new Schema({
   product: { type: Schema.Types.ObjectId, ref: 'Product' },
   description: { type: String, required: true },
   variant: String,
-  quantity: { type: Number, min: 1, default: 1 },
+  quantity: { type: Number, min: 1, default: 1, validate: Number.isSafeInteger },
   unitPrice: { type: Number, min: 0, required: true },
-  taxRate: { type: Number, min: 0, default: 0 },
+  taxRate: { type: Number, min: 0, max: 100, default: 0 },
   discountAmount: { type: Number, min: 0, default: 0 },
   taxAmount: { type: Number, min: 0, default: 0 },
   amount: { type: Number, min: 0, required: true }
@@ -73,9 +74,9 @@ const subscriptionSchema = new Schema({
   number: { type: String, unique: true, index: true },
   customer: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
   plan: { type: Schema.Types.ObjectId, ref: 'Plan', required: true },
-  quotation: { type: Schema.Types.ObjectId, ref: 'Quotation' },
+  quotation: { type: Schema.Types.ObjectId, ref: 'Quotation', unique: true, sparse: true },
   items: [itemSchema],
-  quantity: { type: Number, min: 1, default: 1 },
+  quantity: { type: Number, min: 1, default: 1, validate: Number.isSafeInteger },
   total: { type: Number, min: 0, required: true },
   frequency: { type: String, enum: ['daily', 'weekly', 'monthly', 'yearly'], required: true },
   startDate: { type: Date, default: Date.now },
@@ -122,10 +123,10 @@ const discountSchema = new Schema({
   kind: { type: String, enum: ['percentage', 'fixed'], required: true },
   value: { type: Number, min: 0, required: true },
   minimumPurchase: { type: Number, default: 0 },
-  minimumQuantity: { type: Number, default: 1 },
+  minimumQuantity: { type: Number, min: 1, default: 1, validate: Number.isSafeInteger },
   startsAt: Date,
   endsAt: Date,
-  usageLimit: Number,
+  usageLimit: { type: Number, min: 1, validate: Number.isSafeInteger },
   usageCount: { type: Number, default: 0 },
   products: [{ type: Schema.Types.ObjectId, ref: 'Product' }],
   active: { type: Boolean, default: true }

@@ -5,12 +5,15 @@ import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import cron from 'node-cron';
 import jwt from 'jsonwebtoken';
+import bcrypt from 'bcryptjs';
 import { randomBytes, createHash } from 'node:crypto';
+import { pathToFileURL } from 'node:url';
 import mongoose from 'mongoose';
 import { z } from 'zod';
 import { authenticate, allow } from './middleware/auth.js';
 import { Discount, Invoice, Payment, Plan, Product, Quotation, Subscription, Tax, User } from './models.js';
-import { addPeriod, makeNumber, passwordValid } from './utils.js';
+import { addPeriod, escapeSearch, makeNumber, pageResult, passwordValid, quantityFor, round } from './utils.js';
+import { recordPayment } from './payments.js';
 
 const app = express();
 app.use(helmet());
@@ -19,14 +22,22 @@ app.use(express.json({ limit: '1mb' }));
 app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, limit: 50, standardHeaders: true, legacyHeaders: false }));
 
 const asyncRoute = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
-const objectId = (value) => mongoose.isValidObjectId(value);
+const objectId = (value) => mongoose.isObjectIdOrHexString(value);
 const passwordSchema = z.string().refine(passwordValid, 'Use more than 8 characters with uppercase, lowercase, and a special character.');
-const tokenFor = (user) => jwt.sign({ sub: user.id, role: user.role }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '1d' });
+const tokenFor = (user) => jwt.sign({ sub: user.id, role: user.role, ver: user.tokenVersion || 0 }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '1d' });
 const userView = (user) => ({ id: user.id, name: user.name, email: user.email, role: user.role });
 const scopeCustomer = (query, user) => user.role === 'customer' ? { ...query, customer: user.id } : query;
-const pageResult = (query) => ({ page: Math.max(1, Number(query.page) || 1), limit: Math.min(100, Math.max(1, Number(query.limit) || 50)) });
-const round = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 const fail = (res, status, message) => res.status(status).json({ message });
+
+app.param('id', (req, res, next, value) => objectId(value) ? next() : fail(res, 400, 'Invalid record ID.'));
+app.use('/api', (req, res, next) => {
+  if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) return fail(res, 400, 'Send a JSON object.');
+  if (Object.values(req.query).some((value) => typeof value !== 'string')) return fail(res, 400, 'Query parameters must be plain values.');
+  for (const field of ['customer', 'plan', 'product', 'invoice']) {
+    if (req.body[field] !== undefined && !objectId(req.body[field])) return fail(res, 400, `Invalid ${field} ID.`);
+  }
+  next();
+});
 
 app.get('/api/health', (req, res) => res.json({ status: 'ok', database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected' }));
 
@@ -42,16 +53,19 @@ app.post('/api/auth/register', asyncRoute(async (req, res) => {
 app.post('/api/auth/login', asyncRoute(async (req, res) => {
   const parsed = z.object({ email: z.string().email(), password: z.string().min(1) }).safeParse(req.body);
   if (!parsed.success) return fail(res, 400, 'Enter a valid email and password.');
-  const user = await User.findOne({ email: parsed.data.email.toLowerCase() }).select('+password');
+  const user = await User.findOne({ email: parsed.data.email.toLowerCase() }).select('+password +tokenVersion');
   if (!user || !user.active || !(await user.verifyPassword(parsed.data.password))) return fail(res, 401, 'Email or password is incorrect.');
   res.json({ token: tokenFor(user), user: userView(user) });
 }));
-app.post('/api/auth/logout', authenticate, (req, res) => res.json({ message: 'Signed out.' }));
+app.post('/api/auth/logout', authenticate, asyncRoute(async (req, res) => {
+  await User.updateOne({ _id: req.user._id }, { $inc: { tokenVersion: 1 } });
+  res.json({ message: 'Signed out on all devices.' });
+}));
 app.get('/api/auth/me', authenticate, (req, res) => res.json({ user: userView(req.user) }));
 
 app.post('/api/auth/forgot-password', asyncRoute(async (req, res) => {
   if (process.env.NODE_ENV === 'production' && !process.env.SMTP_HOST) return fail(res, 503, 'Password-reset email delivery is not configured.');
-  const email = String(req.body.email || '').toLowerCase();
+  const email = z.string().trim().email().parse(req.body.email).toLowerCase();
   const user = await User.findOne({ email });
   const response = { message: 'If that account exists, reset instructions are available.' };
   if (!user) return res.json(response);
@@ -71,17 +85,17 @@ app.post('/api/auth/reset-password', asyncRoute(async (req, res) => {
   const parsed = z.object({ token: z.string().min(1), password: passwordSchema }).safeParse(req.body);
   if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   const hashed = createHash('sha256').update(parsed.data.token).digest('hex');
-  const user = await User.findOne({ resetToken: hashed, resetExpires: { $gt: new Date() } });
+  const password = await bcrypt.hash(parsed.data.password, 12);
+  const user = await User.findOneAndUpdate(
+    { resetToken: hashed, resetExpires: { $gt: new Date() } },
+    { $set: { password }, $unset: { resetToken: 1, resetExpires: 1 }, $inc: { tokenVersion: 1 } }
+  );
   if (!user) return fail(res, 400, 'Reset token is invalid or expired.');
-  user.password = parsed.data.password;
-  user.resetToken = undefined;
-  user.resetExpires = undefined;
-  await user.save();
   res.json({ message: 'Password updated. You can now sign in.' });
 }));
 
 app.get('/api/users', authenticate, allow('admin', 'staff'), asyncRoute(async (req, res) => {
-  const role = req.query.role ? { role: req.query.role } : {};
+  const role = req.query.role ? { role: z.enum(['admin', 'staff', 'customer']).parse(req.query.role) } : {};
   const { page, limit } = pageResult(req.query);
   const [items, total] = await Promise.all([User.find(role).select('-password').sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit), User.countDocuments(role)]);
   res.json({ items, total, page, pages: Math.ceil(total / limit) });
@@ -111,7 +125,7 @@ app.patch('/api/profile', authenticate, asyncRoute(async (req, res) => {
 function registerCatalog(path, Model, roles, searchable = 'name') {
   app.get(`/api/${path}`, authenticate, asyncRoute(async (req, res) => {
     const filter = req.user.role === 'customer' ? { active: true } : {};
-    if (req.query.search) filter[searchable] = { $regex: String(req.query.search).slice(0, 80).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
+    if (req.query.search) filter[searchable] = { $regex: escapeSearch(req.query.search), $options: 'i' };
     const { page, limit } = pageResult(req.query);
     const [items, total] = await Promise.all([Model.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit), Model.countDocuments(filter)]);
     res.json({ items, total, page, pages: Math.ceil(total / limit) });
@@ -133,18 +147,20 @@ async function buildItems(inputItems = [], preservePrices = false) {
   if (!Array.isArray(inputItems) || !inputItems.length) throw Object.assign(new Error('Add at least one product or plan item.'), { status: 400 });
   const tax = await Tax.findOne({ active: true }).sort({ rate: -1 });
   return Promise.all(inputItems.map(async (row) => {
-    const product = row.product ? await Product.findById(row.product) : null;
-    if (row.product && !product) throw Object.assign(new Error('A selected product was not found.'), { status: 400 });
+    if (!row || typeof row !== 'object' || Array.isArray(row)) throw Object.assign(new Error('Invalid invoice item.'), { status: 400 });
+    const product = row.product && !preservePrices ? await Product.findById(row.product) : null;
+    if (row.product && !preservePrices && (!product || !product.active)) throw Object.assign(new Error('A selected product is unavailable.'), { status: 400 });
     const variant = product?.variants.find((item) => item.name === row.variant);
     if (product && row.variant && !variant && !preservePrices) throw Object.assign(new Error('The selected product variant is unavailable.'), { status: 400 });
-    const quantity = Math.max(1, Number(row.quantity) || 1);
+    const quantity = quantityFor(row.quantity);
     const unitPrice = product && !preservePrices ? product.salesPrice + (variant?.additionalPrice || 0) : Number(row.unitPrice ?? product?.salesPrice);
     if (!Number.isFinite(unitPrice) || unitPrice < 0) throw Object.assign(new Error('Item price must be zero or more.'), { status: 400 });
-    const rate = Number(row.taxRate ?? tax?.rate ?? 0);
+    const rate = z.coerce.number().min(0).max(100).parse(row.taxRate ?? tax?.rate ?? 0);
     const subtotal = round(unitPrice * quantity);
-    const discountAmount = round(Math.min(subtotal, Number(row.discountAmount) || 0));
+    if (!Number.isFinite(subtotal)) throw Object.assign(new Error('Item subtotal is too large.'), { status: 400 });
+    const discountAmount = round(Math.min(subtotal, z.coerce.number().nonnegative().parse(row.discountAmount ?? 0)));
     const taxAmount = round((subtotal - discountAmount) * rate / 100);
-    return { product: product?._id, description: row.description || product?.name || 'Subscription plan', variant: row.variant, quantity, unitPrice, taxRate: rate, discountAmount, taxAmount, amount: round(subtotal - discountAmount + taxAmount) };
+    return { product: preservePrices ? row.product : product?._id, description: row.description || product?.name || 'Subscription plan', variant: row.variant, quantity, unitPrice, taxRate: rate, discountAmount, taxAmount, amount: round(subtotal - discountAmount + taxAmount) };
   }));
 }
 const totalsFor = (items) => ({
@@ -165,29 +181,44 @@ app.post('/api/quotations', authenticate, allow('admin', 'staff'), asyncRoute(as
   if (!await User.exists({ _id: req.body.customer, role: 'customer', active: true })) return fail(res, 400, 'Select an active customer.');
   const items = await buildItems(req.body.items);
   const totals = totalsFor(items);
-  const quote = await Quotation.create({ ...totals, items, number: makeNumber('QUO'), customer: req.body.customer, plan: req.body.plan || undefined, validUntil: new Date(Date.now() + Math.max(1, Number(req.body.validityDays) || 30) * 86400000) });
+  const validityDays = z.coerce.number().int().min(1).max(3650).parse(req.body.validityDays ?? 30);
+  const quote = await Quotation.create({ ...totals, items, number: makeNumber('QUO'), customer: req.body.customer, plan: req.body.plan || undefined, validUntil: new Date(Date.now() + validityDays * 86400000) });
   res.status(201).json({ item: quote });
 }));
-app.patch('/api/quotations/:id/status', authenticate, allow('admin', 'staff'), asyncRoute(async (req, res) => {
+app.route('/api/quotations/:id/status').all(authenticate, allow('admin', 'staff')).patch(asyncRoute(updateQuotationStatus)).post(asyncRoute(updateQuotationStatus));
+async function updateQuotationStatus(req, res) {
   if (!['sent', 'accepted', 'rejected'].includes(req.body.status)) return fail(res, 400, 'Invalid quotation status.');
   const quote = await Quotation.findById(req.params.id);
   if (!quote) return fail(res, 404, 'Quotation not found.');
+  if (['accepted', 'rejected'].includes(quote.status) && quote.status !== req.body.status) return fail(res, 409, 'This quotation has already been finalized.');
   if (quote.validUntil < new Date() && req.body.status === 'accepted') return fail(res, 400, 'This quotation has expired.');
   quote.status = req.body.status;
   if (req.body.status === 'accepted' && !quote.subscription) {
     if (!quote.plan) return fail(res, 400, 'Choose a plan before converting this quotation.');
     const plan = await Plan.findById(quote.plan);
     if (!plan?.active) return fail(res, 400, 'The selected plan is unavailable.');
-    const subscription = await Subscription.create({
-      number: makeNumber('SUB'), customer: quote.customer, quotation: quote._id, plan: plan._id,
-      items: quote.items, total: quote.total, frequency: plan.frequency, quantity: quote.items[0]?.quantity || plan.minimumQuantity,
-      nextBillingDate: new Date(), status: 'active'
-    });
+    const quantity = quantityFor(quote.items[0]?.quantity ?? plan.minimumQuantity);
+    if (quantity < plan.minimumQuantity) return fail(res, 400, 'The quotation does not meet the plan minimum quantity.');
+    const now = new Date();
+    if (plan.startDate && now < plan.startDate || plan.endDate && now > plan.endDate) return fail(res, 400, 'This plan is outside its availability dates.');
+    if (!await User.exists({ _id: quote.customer, role: 'customer', active: true })) return fail(res, 400, 'The customer account is unavailable.');
+    let subscription;
+    try {
+      subscription = await Subscription.findOneAndUpdate({ quotation: quote._id }, { $setOnInsert: {
+        number: makeNumber('SUB'), customer: quote.customer, quotation: quote._id, plan: plan._id,
+        items: quote.items, total: quote.total, frequency: plan.frequency, quantity,
+        nextBillingDate: new Date(), status: 'active'
+      } }, { upsert: true, new: true, runValidators: true });
+    } catch (error) {
+      if (error.code !== 11000) throw error;
+      subscription = await Subscription.findOne({ quotation: quote._id });
+      if (!subscription) throw error;
+    }
     quote.subscription = subscription._id;
   }
   await quote.save();
   res.json({ item: quote });
-}));
+}
 
 app.get('/api/subscriptions', authenticate, asyncRoute(async (req, res) => {
   const filter = scopeCustomer({}, req.user);
@@ -202,7 +233,7 @@ app.post('/api/subscriptions', authenticate, allow('admin', 'staff'), asyncRoute
   if (!await User.exists({ _id: req.body.customer, role: 'customer', active: true })) return fail(res, 400, 'Select an active customer.');
   const now = new Date();
   if (plan.startDate && now < plan.startDate || plan.endDate && now > plan.endDate) return fail(res, 400, 'This plan is outside its availability dates.');
-  const quantity = Math.max(1, Number(req.body.quantity) || 1);
+  const quantity = quantityFor(req.body.quantity);
   if (quantity < plan.minimumQuantity) return fail(res, 400, `The plan requires at least ${plan.minimumQuantity} seats.`);
   const items = await buildItems(req.body.items?.length ? req.body.items : [{ description: plan.name, unitPrice: plan.price, quantity }]);
   const totals = totalsFor(items);
@@ -217,7 +248,7 @@ app.post('/api/portal/subscriptions', authenticate, allow('customer'), asyncRout
   if (!plan?.active) return fail(res, 400, 'This plan is currently unavailable.');
   const now = new Date();
   if (plan.startDate && now < plan.startDate || plan.endDate && now > plan.endDate) return fail(res, 400, 'This plan is outside its availability dates.');
-  const quantity = Math.max(1, Number(req.body.quantity) || 1);
+  const quantity = quantityFor(req.body.quantity);
   if (quantity < plan.minimumQuantity) return fail(res, 400, `This plan requires at least ${plan.minimumQuantity} seats.`);
   const items = await buildItems([{ description: plan.name, unitPrice: plan.price, quantity }]);
   const totals = totalsFor(items);
@@ -237,11 +268,11 @@ app.patch('/api/subscriptions/:id/action', authenticate, asyncRoute(async (req, 
     if (!['pause-request', 'cancel-request', 'renew-request'].includes(action)) return fail(res, 403, 'Customers can submit requests only.');
     const type = action.replace('-request', '');
     subscription.requests.push({ type });
-  } else if (action === 'pause' && plan.allowPause && subscription.status === 'active') subscription.status = 'paused';
+  } else if (action === 'pause' && plan?.allowPause && subscription.status === 'active') subscription.status = 'paused';
   else if (action === 'resume' && subscription.status === 'paused') subscription.status = 'active';
-  else if (action === 'close' && (plan.allowEarlyClose || subscription.expiryDate <= new Date())) subscription.status = 'closed';
+  else if (action === 'close' && (plan?.allowEarlyClose || subscription.expiryDate <= new Date())) subscription.status = 'closed';
   else if (action === 'activate' && ['draft', 'confirmed'].includes(subscription.status)) subscription.status = 'active';
-  else if (action === 'renew' && plan.allowRenewal && ['closed', 'expired'].includes(subscription.status)) {
+  else if (action === 'renew' && plan?.allowRenewal && ['closed', 'expired'].includes(subscription.status)) {
     subscription.status = 'active';
     subscription.nextBillingDate = new Date();
   } else return fail(res, 400, 'That action is not available for this subscription or plan.');
@@ -249,15 +280,20 @@ app.patch('/api/subscriptions/:id/action', authenticate, asyncRoute(async (req, 
   res.json({ item: subscription, message: req.user.role === 'customer' ? 'Your request has been sent for review.' : 'Subscription updated.' });
 }));
 
-async function generateDueInvoices() {
+export async function generateDueInvoices() {
   const due = await Subscription.find({ status: 'active', nextBillingDate: { $lte: new Date() } }).populate('plan');
   let created = 0;
   for (const subscription of due) {
     const periodStart = new Date(subscription.nextBillingDate);
     const periodEnd = addPeriod(periodStart, subscription.frequency);
+    const billingKey = `${subscription.id}:${periodStart.toISOString()}`;
     if (subscription.expiryDate && periodStart > subscription.expiryDate && subscription.plan?.autoClose) {
       subscription.status = 'expired';
       await subscription.save();
+      continue;
+    }
+    if (await Invoice.exists({ billingKey })) {
+      await Subscription.updateOne({ _id: subscription._id, nextBillingDate: periodStart }, { $set: { nextBillingDate: periodEnd } });
       continue;
     }
     let items;
@@ -294,18 +330,15 @@ async function generateDueInvoices() {
     try {
       await Invoice.create({
         number: makeNumber('INV'), customer: subscription.customer, subscription: subscription._id,
-        billingPeriodStart: periodStart, billingPeriodEnd: periodEnd, billingKey: `${subscription.id}:${periodStart.toISOString()}`,
-        items, ...totals, total: totals.total, outstanding: totals.total, dueDate: addPeriod(new Date(), 'monthly')
+        billingPeriodStart: periodStart, billingPeriodEnd: periodEnd, billingKey,
+        items, ...totals, total: totals.total, outstanding: totals.total, status: totals.total === 0 ? 'paid' : 'confirmed', dueDate: addPeriod(new Date(), 'monthly')
       });
-      subscription.nextBillingDate = periodEnd;
-      await subscription.save();
       created += 1;
     } catch (error) {
       if (discountClaimed) await Discount.updateOne({ _id: discount._id }, { $inc: { usageCount: -1 } });
-      if (error.code !== 11000) throw error;
-      subscription.nextBillingDate = periodEnd;
-      await subscription.save();
+      if (error.code !== 11000 || !await Invoice.exists({ billingKey })) throw error;
     }
+    await Subscription.updateOne({ _id: subscription._id, nextBillingDate: periodStart }, { $set: { nextBillingDate: periodEnd } });
   }
   return { created, checked: due.length };
 }
@@ -325,18 +358,22 @@ app.get('/api/invoices/:id', authenticate, asyncRoute(async (req, res) => {
 }));
 app.patch('/api/invoices/:id/status', authenticate, allow('admin', 'staff'), asyncRoute(async (req, res) => {
   if (!['confirmed', 'cancelled'].includes(req.body.status)) return fail(res, 400, 'Invalid invoice status.');
-  const invoice = await Invoice.findById(req.params.id);
-  if (!invoice) return fail(res, 404, 'Invoice not found.');
-  if (req.body.status === 'cancelled' && invoice.paidAmount > 0) return fail(res, 400, 'An invoice with recorded payments cannot be cancelled.');
-  invoice.status = req.body.status;
-  await invoice.save();
+  const invoice = await Invoice.findOneAndUpdate(
+    { _id: req.params.id, paidAmount: 0, total: { $gt: 0 } },
+    { $set: { status: req.body.status } },
+    { new: true }
+  );
+  if (!invoice) {
+    if (!await Invoice.exists({ _id: req.params.id })) return fail(res, 404, 'Invoice not found.');
+    return fail(res, 400, 'A paid or partially paid invoice cannot change status manually.');
+  }
   res.json({ item: invoice });
 }));
 app.post('/api/invoices', authenticate, allow('admin', 'staff'), asyncRoute(async (req, res) => {
   if (!await User.exists({ _id: req.body.customer, role: 'customer' })) return fail(res, 400, 'Select a customer.');
   const items = await buildItems(req.body.items);
   const totals = totalsFor(items);
-  const invoice = await Invoice.create({ ...totals, items, number: makeNumber('INV'), customer: req.body.customer, dueDate: req.body.dueDate || addPeriod(new Date(), 'monthly'), outstanding: totals.total });
+  const invoice = await Invoice.create({ ...totals, items, number: makeNumber('INV'), customer: req.body.customer, dueDate: req.body.dueDate || addPeriod(new Date(), 'monthly'), outstanding: totals.total, status: totals.total === 0 ? 'paid' : 'confirmed' });
   res.status(201).json({ item: invoice });
 }));
 
@@ -351,23 +388,7 @@ app.post('/api/payments', authenticate, allow('admin', 'staff'), asyncRoute(asyn
   if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   const amount = round(parsed.data.amount);
   if (amount < 0.01) return fail(res, 400, 'Payment must be at least ₹0.01.');
-  const invoice = await Invoice.findOneAndUpdate(
-    { _id: parsed.data.invoice, status: { $in: ['confirmed', 'partial'] }, outstanding: { $gte: amount } },
-    { $inc: { paidAmount: amount, outstanding: -amount } },
-    { new: true }
-  );
-  if (!invoice) return fail(res, 400, 'Open invoice not found or payment exceeds the outstanding balance.');
-  let payment;
-  try {
-    payment = await Payment.create({ ...parsed.data, amount, customer: invoice.customer });
-    await Invoice.updateOne({ _id: invoice._id, outstanding: 0 }, { $set: { status: 'paid' } });
-    await Invoice.updateOne({ _id: invoice._id, outstanding: { $gt: 0 } }, { $set: { status: 'partial' } });
-  } catch (error) {
-    await Invoice.updateOne({ _id: invoice._id }, { $inc: { paidAmount: -amount, outstanding: amount } });
-    throw error;
-  }
-  invoice.status = invoice.outstanding === 0 ? 'paid' : 'partial';
-  res.status(201).json({ item: payment, invoice });
+  res.status(201).json(await recordPayment({ ...parsed.data, amount }));
 }));
 
 app.get('/api/dashboard/summary', authenticate, allow('admin', 'staff'), asyncRoute(async (req, res) => {
@@ -418,18 +439,27 @@ app.use((req, res) => res.status(404).json({ message: 'API route not found.' }))
 app.use((error, req, res, next) => {
   if (res.headersSent) return next(error);
   if (error.code === 11000) return res.status(409).json({ message: 'That record already exists.' });
-  if (error instanceof mongoose.Error.ValidationError || error instanceof z.ZodError) return res.status(400).json({ message: error.message });
+  if (error instanceof mongoose.Error.CastError) return res.status(400).json({ message: `Invalid value for ${error.path}.` });
+  if (error instanceof z.ZodError) return res.status(400).json({ message: error.issues[0].message });
+  if (error instanceof mongoose.Error.ValidationError) return res.status(400).json({ message: error.message });
   const status = error.status || 500;
   if (status >= 500) console.error(error);
   res.status(status).json({ message: status >= 500 ? 'A server error occurred.' : error.message });
 });
 
-const port = Number(process.env.PORT || 4000);
-if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32 || process.env.JWT_SECRET.startsWith('replace-with-')) throw new Error('Set JWT_SECRET to a private random value of at least 32 characters in backend/.env.');
-await mongoose.connect(process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/subsight');
-console.log('Connected to MongoDB');
-cron.schedule('0 2 * * *', async () => {
-  try { console.info('Scheduled billing run:', await generateDueInvoices()); }
-  catch (error) { console.error('Scheduled billing run failed:', error); }
-});
-app.listen(port, () => console.log(`SubSight API listening on http://localhost:${port}`));
+export { app };
+
+export async function startServer() {
+  const port = Number(process.env.PORT || 4000);
+  if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32 || process.env.JWT_SECRET.startsWith('replace-with-')) throw new Error('Set JWT_SECRET to a private random value of at least 32 characters in backend/.env.');
+  await mongoose.connect(process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/subsight');
+  await Promise.all(Object.values(mongoose.models).map((Model) => Model.init()));
+  console.log('Connected to MongoDB');
+  cron.schedule('0 2 * * *', async () => {
+    try { console.info('Scheduled billing run:', await generateDueInvoices()); }
+    catch (error) { console.error('Scheduled billing run failed:', error); }
+  });
+  return app.listen(port, () => console.log(`SubSight API listening on http://localhost:${port}`));
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await startServer();
