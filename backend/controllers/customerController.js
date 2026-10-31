@@ -1,106 +1,53 @@
-
+import { z } from 'zod';
 import { User } from '../models.js';
+import { escapeSearch, pageResult, passwordValid } from '../utils.js';
 
-export const createCustomer = async (req, res) => {
-  try {
-    const { name, email, password } = req.body;
+const customerFields = z.object({
+  name: z.string().trim().min(2).max(120),
+  email: z.string().trim().email().transform((value) => value.toLowerCase()),
+  company: z.string().trim().max(200).optional(),
+  phone: z.string().trim().max(40).optional(),
+  address: z.string().trim().max(1000).optional(),
+  active: z.boolean().optional()
+});
 
-    if (!name || !email || !password) {
-      return res.status(400).json({ message: 'All fields are required.' });
-    }
+export async function createCustomer(req, res) {
+  const data = customerFields.extend({ password: z.string().refine(passwordValid, 'Use more than 8 characters, uppercase, lowercase and a special character.') }).parse(req.body);
+  const customer = await User.create({ ...data, role: 'customer' });
+  res.status(201).json({ item: await User.findById(customer._id), message: 'Customer created.' });
+}
 
-    const normalizedEmail = email.toLowerCase().trim();
-
-    const existing = await User.findOne({ email: normalizedEmail });
-
-    if (existing) {
-      return res.status(409).json({ message: 'Email already exists.' });
-    }
-
-    const customer = await User.create({
-      name,
-      email: normalizedEmail,
-      password,
-      role: 'customer'
-    });
-
-    res.status(201).json({
-      message: 'Customer created successfully.',
-      customer: {
-        id: customer._id,
-        name: customer.name,
-        email: customer.email,
-        role: customer.role
-      }
-    });
-  } catch (error) {
-    res.status(400).json({ message: error.message });
+export async function getCustomers(req, res) {
+  const filter = { role: 'customer' };
+  if (req.query.search) {
+    const search = { $regex: escapeSearch(req.query.search), $options: 'i' };
+    filter.$or = [{ name: search }, { email: search }, { company: search }];
   }
-};
+  const { page, limit } = pageResult(req.query);
+  const [items, total] = await Promise.all([
+    User.find(filter).sort({ createdAt: -1, _id: -1 }).skip((page - 1) * limit).limit(limit),
+    User.countDocuments(filter)
+  ]);
+  res.json({ items, total, page, pages: Math.ceil(total / limit) });
+}
 
-export const getCustomers = async (req, res) => {
-  try {
-    const customers = await User.find({ role: 'customer' })
-      .select('-password')
-      .sort({ createdAt: -1 });
+export async function getCustomerById(req, res) {
+  const customer = await User.findOne({ _id: req.params.id, role: 'customer' });
+  if (!customer) return res.status(404).json({ message: 'Customer not found.' });
+  res.json({ item: customer });
+}
 
-    res.json({ customers });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-};
+export async function updateCustomer(req, res) {
+  const data = customerFields.partial().parse(req.body);
+  if (!Object.keys(data).length) return res.status(400).json({ message: 'Choose customer fields to update.' });
+  const customer = await User.findOneAndUpdate(
+    { _id: req.params.id, role: 'customer' }, { $set: data }, { new: true, runValidators: true }
+  );
+  if (!customer) return res.status(404).json({ message: 'Customer not found.' });
+  res.json({ item: customer, message: 'Customer updated.' });
+}
 
-export const getCustomerById = async (req, res) => {
-  try {
-    const customer = await User.findOne({
-      _id: req.params.id,
-      role: 'customer'
-    }).select('-password');
-
-    if (!customer) {
-      return res.status(404).json({ message: 'Customer not found.' });
-    }
-
-    res.json({ customer });
-  } catch (error) {
-    res.status(400).json({ message: error.message });
-  }
-};
-
-export const updateCustomer = async (req, res) => {
-  try {
-    const { name, email, active } = req.body;
-
-    const customer = await User.findOneAndUpdate(
-      { _id: req.params.id, role: 'customer' },
-      { $set: { name, email: email?.toLowerCase().trim(), active } },
-      { new: true, runValidators: true }
-    ).select('-password');
-
-    if (!customer) {
-      return res.status(404).json({ message: 'Customer not found.' });
-    }
-
-    res.json({ message: 'Customer updated.', customer });
-  } catch (error) {
-    res.status(400).json({ message: error.message });
-  }
-};
-
-export const deleteCustomer = async (req, res) => {
-  try {
-    const customer = await User.findOneAndUpdate(
-      { _id: req.params.id, role: 'customer' },
-      { active: false },
-      { new: true }
-    ).select('-password');
-
-    if (!customer) {
-      return res.status(404).json({ message: 'Customer not found.' });
-    }
-
-    res.json({ message: 'Customer deactivated.', customer });
-  } catch (error) {
-    res.status(400).json({ message: error.message });
-  }
-};
+export async function deleteCustomer(req, res) {
+  req.body = { active: false };
+  return updateCustomer(req, res);
+}

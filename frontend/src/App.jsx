@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { BrowserRouter, Link, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import {
   Activity, ArrowDownLeft, ArrowLeftRight, ArrowUpRight, BadgeIndianRupee, Boxes,
@@ -6,8 +6,10 @@ import {
   FileText, LayoutDashboard, LogOut, Menu, Plus, Search, Settings2, ShieldCheck,
   Sparkles, Tag, UserRoundCog, Users, X
 } from 'lucide-react';
-import { request } from './api'
+import { request, requestAll } from './api';
 import Landing from './Landing (1).jsx';
+import { AuditPanel, ReportsPanel } from './OperationsPanels.jsx';
+import DocumentView from './DocumentView.jsx';
 
 const RevenueChart = lazy(() => import('./RevenueChart.jsx'));
 const chartMonths = Array.from({ length: 6 }, (_, index) => {
@@ -20,7 +22,7 @@ const chartMonths = Array.from({ length: 6 }, (_, index) => {
   };
 });
 const currentYear = new Date().getFullYear();
-const money = (value) => new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }).format(Number(value) || 0);
+const money = (value) => new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 2 }).format(Number(value) || 0);
 const date = (value) => value ? new Intl.DateTimeFormat('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }).format(new Date(value)) : '—';
 const titleCase = (value = '') => value.replace(/([A-Z])/g, ' $1').replace(/[-_]/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
 const navBase = [
@@ -40,7 +42,9 @@ const navBase = [
     { label: 'Discounts', path: '/discounts', Icon: Tag },
     { label: 'Tax rates', path: '/taxes', Icon: BadgeIndianRupee }
   ] },
-  { title: 'Access', links: [{ label: 'Team members', path: '/team', Icon: UserRoundCog }] }
+  { title: 'Insights', links: [{ label: 'Reports', path: '/reports', Icon: Activity }, { label: 'Audit & checks', path: '/audit', Icon: ShieldCheck }] },
+  { title: 'Access', links: [{ label: 'Team members', path: '/team', Icon: UserRoundCog }] },
+  { title: 'Settings', links: [{ label: 'My profile', path: '/profile', Icon: Settings2 }] }
 ];
 
 const listConfig = {
@@ -62,8 +66,8 @@ const listConfig = {
   products: { title: 'Products', subtitle: 'The software and add-ons behind every subscription.', endpoint: '/products', create: 'product', columns: [
     ['name', 'Product'], ['type', 'Type'], ['description', 'Description'], ['salesPrice', 'Sales price', 'money'], ['active', 'Availability', 'boolean']
   ] },
-  customers: { title: 'Customers', subtitle: 'The people and businesses you work with.', endpoint: '/users?role=customer', columns: [
-    ['name', 'Customer'], ['email', 'Email'], ['createdAt', 'Joined', 'date'], ['active', 'Account', 'boolean']
+  customers: { title: 'Customers', subtitle: 'The people and businesses you work with.', endpoint: '/customers', create: 'customer', columns: [
+    ['name', 'Customer'], ['email', 'Email'], ['company', 'Company'], ['createdAt', 'Joined', 'date'], ['active', 'Account', 'boolean']
   ] },
   discounts: { title: 'Discounts', subtitle: 'Manage promotional rules and their usage limits.', endpoint: '/discounts', create: 'discount', columns: [
     ['name', 'Discount'], ['kind', 'Type'], ['value', 'Value', 'discountValue'], ['usageCount', 'Used'], ['usageLimit', 'Limit'], ['active', 'Availability', 'boolean']
@@ -71,12 +75,18 @@ const listConfig = {
   taxes: { title: 'Tax rates', subtitle: 'Configure the active rate used for new invoice lines.', endpoint: '/taxes', create: 'tax', columns: [
     ['name', 'Tax'], ['rate', 'Rate', 'percent'], ['active', 'Availability', 'boolean'], ['createdAt', 'Created', 'date']
   ] },
-  team: { title: 'Team members', subtitle: 'Manage the people who help run your subscription operations.', endpoint: '/users?role=staff', create: 'staff', columns: [
+  team: { title: 'Team members', subtitle: 'Manage the people who help run your subscription operations.', endpoint: '/users?role=internal', create: 'staff', columns: [
     ['name', 'Name'], ['email', 'Email'], ['role', 'Role'], ['createdAt', 'Added', 'date'], ['active', 'Account', 'boolean']
   ] }
 };
 
 const fields = {
+  customer: [
+    { name: 'name', label: 'Full name', required: true }, { name: 'email', label: 'Email', type: 'email', required: true },
+    { name: 'password', label: 'Initial password', type: 'password', required: true },
+    { name: 'company', label: 'Company' }, { name: 'phone', label: 'Phone' }, { name: 'address', label: 'Address', type: 'textarea' }
+  ],
+  member: [{ name: 'name', label: 'Full name', required: true }],
   product: [
     { name: 'name', label: 'Product name', required: true },
     { name: 'type', label: 'Product type', type: 'select', options: ['software', 'addon', 'service'] },
@@ -140,7 +150,8 @@ const fields = {
     { name: 'minimumPurchase', label: 'Minimum purchase (₹)', type: 'number' },
     { name: 'minimumQuantity', label: 'Minimum quantity', type: 'number' },
     { name: 'usageLimit', label: 'Maximum uses', type: 'number' },
-    { name: 'startsAt', label: 'Starts on', type: 'date' }, { name: 'endsAt', label: 'Ends on', type: 'date' }
+    { name: 'startsAt', label: 'Starts on', type: 'date' }, { name: 'endsAt', label: 'Ends on', type: 'date' },
+    { name: 'products', label: 'Eligible products (leave empty for all lines)', type: 'products' }
   ],
   tax: [
     { name: 'name', label: 'Tax name', required: true },
@@ -148,8 +159,8 @@ const fields = {
   ]
 };
 
-function AuthPage({ onLogin }) {
-  const [mode, setMode] = useState('login');
+function AuthPage({ onLogin, initialMode = 'login' }) {
+  const [mode, setMode] = useState(initialMode);
   const [form, setForm] = useState({ name: '', email: '', password: '', token: '' });
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -215,7 +226,7 @@ function Field({ label, type = 'text', value, onChange, required, placeholder, a
   return <label className="field"><span>{label}{required && <i> *</i>}</span><input type={type} value={value ?? ''} onChange={onChange} required={required} placeholder={placeholder} autoComplete={autoComplete} min={type === 'number' ? '0' : undefined} step={type === 'number' ? 'any' : undefined} readOnly={readOnly} /></label>;
 }
 
-function Workspace({ user, onLogout }) {
+function Workspace({ user, onLogout, onUserUpdate }) {
   const location = useLocation();
   const role = user.role;
   const isCustomer = role === 'customer';
@@ -225,14 +236,19 @@ function Workspace({ user, onLogout }) {
   const [loadedPath, setLoadedPath] = useState('');
   const [modal, setModal] = useState('');
   const [modalData, setModalData] = useState({});
+  const [editingId, setEditingId] = useState('');
+  const [modalError, setModalError] = useState('');
+  const [documentRecord, setDocumentRecord] = useState(null);
   const [requestReview, setRequestReview] = useState(null);
   const [reviewBusy, setReviewBusy] = useState(false);
   const [catalogues, setCatalogues] = useState({ customers: [], plans: [], products: [], invoices: [] });
   const [list, setList] = useState([]);
-  const [filter, setFilter] = useState('');
+  const [search, setSearch] = useState({ path: '', value: '' });
   const [toast, setToast] = useState('');
   const [busy, setBusy] = useState(false);
   const current = location.pathname.replace(/^\//, '') || 'dashboard';
+  const filter = search.path === current ? search.value : '';
+  const setFilter = (value) => setSearch({ path: current, value });
   const config = listConfig[current];
   const canManage = role === 'admin' || role === 'staff';
 
@@ -248,47 +264,30 @@ function Workspace({ user, onLogout }) {
   const fetchList = useCallback(async (path = current) => {
     if (!config) return;
     try {
-      let result = await request('get', current === 'subscriptions' ? '/subscriptions?page=1&limit=100' : config.endpoint);
-      let items = result.items || [];
-      if (current === 'subscriptions' && result.pages > 1) {
-        const pages = await Promise.all(Array.from({ length: result.pages - 1 }, (_, index) =>
-          request('get', `/subscriptions?page=${index + 2}&limit=100`)
-        ));
-        items = items.concat(...pages.map((pageResult) => pageResult.items || []));
-      }
-      setList(items);
+      setList(await requestAll(config.endpoint));
       setLoadError('');
     } catch (error) { setList([]); setLoadError(error.message); }
     finally { setLoadedPath(path); }
   }, [config, current]);
 
   useEffect(() => {
-    if (current === 'profile') {
-      request('get', '/profile').catch((error) => setLoadError(error.message));
-      return;
-    }
     if (current !== 'dashboard' && !config) return;
+    const controller = new AbortController();
     const loadPage = async () => {
       try {
-        const result = await request('get', current === 'dashboard' ? (isCustomer ? '/portal/dashboard' : '/dashboard/summary') : current === 'subscriptions' ? '/subscriptions?page=1&limit=100' : config.endpoint);
-        if (current === 'dashboard') setDashboard(result);
-        else {
-          let items = result.items || [];
-          if (current === 'subscriptions' && result.pages > 1) {
-            const pages = await Promise.all(Array.from({ length: result.pages - 1 }, (_, index) =>
-              request('get', `/subscriptions?page=${index + 2}&limit=100`)
-            ));
-            items = items.concat(...pages.map((pageResult) => pageResult.items || []));
-          }
-          setList(items);
+        if (current === 'dashboard') {
+          const result = await request('get', isCustomer ? '/portal/dashboard' : '/dashboard/summary', undefined, { signal: controller.signal });
+          setDashboard(result);
+        } else {
+          setList(await requestAll(config.endpoint, { signal: controller.signal }));
         }
         setLoadError('');
       } catch (error) {
-        if (current !== 'dashboard') setList([]);
-        setLoadError(error.message);
-      } finally { setLoadedPath(current); }
+        if (!error.cancelled) { if (current !== 'dashboard') setList([]); setLoadError(error.message); }
+      } finally { if (!controller.signal.aborted) setLoadedPath(current); }
     };
     loadPage();
+    return () => controller.abort();
   }, [current, config, isCustomer]);
 
   const links = useMemo(() => {
@@ -314,19 +313,36 @@ function Workspace({ user, onLogout }) {
   }
 
   async function openCreate(type) {
-    setModal(type); setModalData(type === 'product' ? { type: 'software' } : type === 'plan' ? { frequency: 'monthly', minimumQuantity: 1, allowPause: true, allowRenewal: true, allowEarlyClose: true, autoClose: true, products: [] } : type === 'subscription' || type === 'quotation' ? { quantity: 1, validityDays: 30 } : type === 'payment' ? { method: 'upi' } : type === 'discount' ? { kind: 'percentage', minimumQuantity: 1 } : {});
+    setEditingId(''); setModalError('');
+    setModal(type); setModalData(type === 'product' ? { type: 'software' } : type === 'plan' ? { frequency: 'monthly', minimumQuantity: 1, allowPause: true, allowRenewal: true, allowEarlyClose: true, autoClose: true, products: [] } : type === 'subscription' || type === 'quotation' ? { quantity: 1, validityDays: 30 } : type === 'payment' ? { method: 'upi', requestKey: crypto.randomUUID() } : type === 'discount' ? { kind: 'percentage', minimumQuantity: 1 } : {});
     try {
       const requests = [];
-      if (['subscription', 'quotation', 'invoice', 'staff'].includes(type)) requests.push(request('get', '/users?role=customer').then((r) => setCatalogues((v) => ({ ...v, customers: r.items || [] }))));
-      if (['subscription', 'quotation'].includes(type)) requests.push(request('get', '/plans').then((r) => setCatalogues((v) => ({ ...v, plans: r.items || [] }))));
-      if (['subscription', 'quotation', 'plan'].includes(type)) requests.push(request('get', '/products').then((r) => setCatalogues((v) => ({ ...v, products: r.items || [] }))));
-      if (type === 'payment') requests.push(request('get', '/invoices').then((r) => setCatalogues((v) => ({ ...v, invoices: (r.items || []).filter((item) => item.outstanding > 0) }))));
+      if (['subscription', 'quotation', 'invoice', 'staff'].includes(type)) requests.push(requestAll('/customers').then((items) => setCatalogues((value) => ({ ...value, customers: items.filter((item) => item.active) }))));
+      if (['subscription', 'quotation'].includes(type)) requests.push(requestAll('/plans').then((items) => setCatalogues((value) => ({ ...value, plans: items.filter((item) => item.active) }))));
+      if (['subscription', 'quotation', 'plan', 'discount'].includes(type)) requests.push(requestAll('/products').then((items) => setCatalogues((value) => ({ ...value, products: items }))));
+      if (type === 'payment') requests.push(requestAll('/invoices').then((items) => setCatalogues((value) => ({ ...value, invoices: items.filter((item) => item.outstanding > 0 && ['confirmed', 'partial'].includes(item.status)) }))));
       await Promise.all(requests);
     } catch (error) { setModal(''); notify(error.message); }
   }
 
+  async function openEdit(item) {
+    const type = current === 'team' ? 'member' : config.create;
+    setModalError(''); setEditingId(item._id); setModal(type);
+    const values = {};
+    for (const field of fields[type]) {
+      if (field.name === 'password') continue;
+      const value = item[field.name];
+      values[field.name] = field.type === 'date' && value ? value.slice(0, 10) : field.name === 'variants' ? JSON.stringify(value || []) : value ?? (field.type === 'products' ? [] : '');
+    }
+    setModalData(values);
+    if (['plan', 'discount'].includes(type)) {
+      try { setCatalogues((value) => ({ ...value, products: [] })); const products = await requestAll('/products'); setCatalogues((value) => ({ ...value, products })); }
+      catch (error) { setModalError(error.message); }
+    }
+  }
+
   async function submitModal(event) {
-    event.preventDefault(); setBusy(true);
+    event.preventDefault(); setBusy(true); setModalError('');
     try {
       const values = { ...modalData };
       Object.keys(values).forEach((key) => { if (values[key] === '' || values[key] === undefined) delete values[key]; });
@@ -350,19 +366,19 @@ function Workspace({ user, onLogout }) {
         }
       }
       if (modal === 'invoice') values.items = [{ description: values.description, unitPrice: values.amount, quantity: values.quantity || 1 }];
-      const urls = { product: '/products', plan: '/plans', subscription: '/subscriptions', quotation: '/quotations', invoice: '/invoices', payment: '/payments', staff: '/users/staff', tax: '/taxes', discount: '/discounts', portalSubscribe: '/portal/subscriptions' };
-      await request('post', urls[modal], values);
+      const urls = { product: '/products', plan: '/plans', subscription: '/subscriptions', quotation: '/quotations', invoice: '/invoices', payment: '/payments', staff: '/users/staff', tax: '/taxes', discount: '/discounts', portalSubscribe: '/portal/subscriptions', customer: '/customers', member: '/users' };
+      const result = await request(editingId ? 'patch' : 'post', urls[modal] + (editingId ? '/' + editingId : ''), values);
       setModal('');
-      notify(modal === 'payment' ? 'Payment recorded and invoice balance updated.' : modal === 'quotation' ? 'Quotation created.' : 'Saved successfully.');
+      notify(modal === 'payment' ? result.message : modal === 'quotation' ? 'Quotation created.' : 'Saved successfully.');
       if (current === 'dashboard') fetchDashboard(); else fetchList();
     } catch (error) {
-      notify(error.message || 'Check the form values and try again.');
+      setModalError(error.message || 'Check the form values and try again.');
     } finally { setBusy(false); }
   }
 
   async function action(path, data, success) {
     try {
-      await request('post', path, data);
+      await request('patch', path, data);
       notify(success); fetchList();
     } catch (error) { notify(error.message); }
   }
@@ -389,7 +405,7 @@ function Workspace({ user, onLogout }) {
   }
 
   async function toggleRecord(item) {
-    const collection = { team: 'users', customers: 'users', products: 'products', plans: 'plans', discounts: 'discounts', taxes: 'taxes' }[current];
+    const collection = { team: 'users', customers: 'customers', products: 'products', plans: 'plans', discounts: 'discounts', taxes: 'taxes' }[current];
     try {
       await request('patch', `/${collection}/${item._id}`, { active: !item.active });
       notify(`${item.name || item.email} ${item.active ? 'deactivated' : 'reactivated'}.`);
@@ -397,12 +413,12 @@ function Workspace({ user, onLogout }) {
     } catch (error) { notify(error.message); }
   }
 
-  const pageTitle = current === 'dashboard' ? 'Overview' : current === 'profile' ? 'My profile' : config?.title || titleCase(current);
-  const pageSubtitle = current === 'dashboard' ? (isCustomer ? 'Your account, billing and subscriptions at a glance.' : 'A clear view of your recurring business.') : config?.subtitle || (current === 'profile' ? 'Update your SubSight account details.' : '');
+  const pageTitle = current === 'dashboard' ? 'Overview' : current === 'profile' ? 'My profile' : current === 'audit' ? 'Audit & checks' : config?.title || titleCase(current);
+  const pageSubtitle = current === 'dashboard' ? (isCustomer ? 'Your account, billing and subscriptions at a glance.' : 'A clear view of your recurring business.') : config?.subtitle || ({ profile: 'Update your SubSight account details.', reports: 'Financial summaries and exports from your saved records.', audit: 'Review account activity and verify billing balances.' }[current] || '');
   const filteredList = list.filter((item) => JSON.stringify(item).toLowerCase().includes(filter.toLowerCase()));
 
-  if (!['dashboard', 'profile', ...Object.keys(listConfig)].includes(current)) return <Navigate to="/dashboard" replace />;
-  if (isCustomer && ['customers', 'products', 'quotations', 'discounts', 'taxes'].includes(current)) return <Navigate to="/dashboard" replace />;
+  if (!['dashboard', 'profile', 'reports', 'audit', ...Object.keys(listConfig)].includes(current)) return <Navigate to="/dashboard" replace />;
+  if (isCustomer && ['customers', 'products', 'quotations', 'discounts', 'taxes', 'reports', 'audit'].includes(current)) return <Navigate to="/dashboard" replace />;
   if (role === 'staff' && ['discounts', 'taxes', 'team'].includes(current)) return <Navigate to="/dashboard" replace />;
   if (isCustomer && current === 'team') return <Navigate to="/dashboard" replace />;
 
@@ -437,27 +453,31 @@ function Workspace({ user, onLogout }) {
             {current === 'subscriptions' && canManage && <button className="button primary" onClick={() => openCreate('subscription')}><Plus size={16} /> New subscription</button>}
             {current === 'quotations' && canManage && <button className="button primary" onClick={() => openCreate('quotation')}><Plus size={16} /> Create quote</button>}
             {current === 'payments' && !isCustomer && <button className="button primary" onClick={() => openCreate('payment')}><Plus size={16} /> Record payment</button>}
-            {config?.create && canManage && !['invoice', 'subscription', 'quotation'].includes(config.create) && <button className="button primary" onClick={() => openCreate(config.create)}><Plus size={16} /> {config.create === 'product' ? 'Add product' : config.create === 'plan' ? 'New plan' : config.create === 'discount' ? 'Add discount' : config.create === 'staff' ? 'Add team member' : 'Add tax rate'}</button>}
+            {config?.create && (role === 'admin' || canManage && config.create === 'customer') && !['invoice', 'subscription', 'quotation'].includes(config.create) && <button className="button primary" onClick={() => openCreate(config.create)}><Plus size={16} /> {config.create === 'product' ? 'Add product' : config.create === 'plan' ? 'New plan' : config.create === 'discount' ? 'Add discount' : config.create === 'staff' ? 'Add team member' : config.create === 'customer' ? 'Add customer' : 'Add tax rate'}</button>}
             {current === 'plans' && isCustomer && <span className="small-note">Choose a plan to get started</span>}
           </div>
         </div>
         {loadError && <div className="notice error-notice inline-notice">{loadError}<button onClick={() => current === 'dashboard' ? fetchDashboard() : fetchList()}>Try again</button></div>}
         {current === 'dashboard' && <Dashboard data={dashboard} busy={loadedPath !== current && !loadError} customer={isCustomer} />}
-        {current === 'profile' && <ProfilePanel user={user} onSave={async (name) => { try { const result = await request('patch', '/profile', { name }); notify('Profile updated.'); return result.user; } catch (error) { notify(error.message); return null; } }} />}
-        {config && <ListPage
+        {current === 'profile' && <ProfilePanel user={user} onSave={async (name) => { try { const result = await request('patch', '/profile', { name }); onUserUpdate(result.user); notify('Profile updated.'); return result.user; } catch (error) { notify(error.message); return null; } }} />}
+        {current === 'reports' && <ReportsPanel />}
+        {current === 'audit' && <AuditPanel />}
+        {config && <ListPage key={current}
           config={config} rows={filteredList} busy={loadedPath !== current && !loadError} query={filter} setQuery={setFilter} role={role} page={current}
-          onRefresh={fetchList} onAction={action} onSubscriptionAction={subscriptionAction} onToggle={toggleRecord} onReviewRequest={setRequestReview}
-          onPayment={(invoice) => { setModalData({ invoice: invoice._id, amount: invoice.outstanding, method: 'upi' }); setModal('payment'); request('get', '/invoices').then((r) => setCatalogues((v) => ({ ...v, invoices: (r.items || []).filter((item) => item.outstanding > 0) }))).catch((error) => notify(error.message)); }}
-          onSubscribe={(plan) => { setModalData({ plan: plan._id, quantity: plan.minimumQuantity || 1 }); setModal('portalSubscribe'); }}
+          onRefresh={fetchList} onAction={action} onSubscriptionAction={subscriptionAction} onToggle={toggleRecord} onReviewRequest={setRequestReview} onEdit={openEdit} onDocument={(item) => setDocumentRecord({ kind: current, recordId: item._id })} onInvoiceStatus={(item, status) => { if (window.confirm('Cancel invoice ' + item.number + '?')) action('/invoices/' + item._id + '/status', { status }, 'Invoice cancelled.'); }}
+          onPayment={(invoice) => { setEditingId(''); setModalError(''); setModalData({ invoice: invoice._id, amount: invoice.outstanding, method: 'upi', requestKey: crypto.randomUUID() }); setModal('payment'); requestAll('/invoices').then((items) => setCatalogues((value) => ({ ...value, invoices: items.filter((item) => item.outstanding > 0 && ['confirmed', 'partial'].includes(item.status)) }))).catch((error) => notify(error.message)); }}
+          onSubscribe={(plan) => { setEditingId(''); setModalError(''); setModalData({ plan: plan._id, quantity: plan.minimumQuantity || 1 }); setModal('portalSubscribe'); }}
         />}
       </div>
     </main>
-    {modal && <Modal title={modal === 'portalSubscribe' ? 'Start a subscription' : modal === 'staff' ? 'Add team member' : modal === 'quotation' ? 'Prepare a quotation' : modal === 'payment' ? 'Record a payment' : modal === 'invoice' ? 'Create an invoice' : `Create ${titleCase(modal)}`} subtitle={modal === 'payment' ? 'Record the amount received against an open invoice.' : 'Add the details to keep your billing records accurate.'} onClose={() => setModal('')}>
+    {modal && <Modal title={editingId ? 'Edit ' + titleCase(modal) : modal === 'portalSubscribe' ? 'Start a subscription' : modal === 'staff' ? 'Add team member' : modal === 'quotation' ? 'Prepare a quotation' : modal === 'payment' ? 'Record a payment' : modal === 'invoice' ? 'Create an invoice' : `Create ${titleCase(modal)}`} subtitle={modal === 'payment' ? 'Record the amount received against an open invoice.' : 'Add the details to keep your billing records accurate.'} onClose={() => setModal('')}>
       <form className="modal-form" onSubmit={submitModal}>
-        {fields[modal].map((field) => <FormInput key={field.name} field={field} value={modalData[field.name]} options={field.type === 'customer' ? catalogues.customers : field.type === 'plan' ? catalogues.plans : field.type === 'invoice' ? catalogues.invoices : field.type === 'product' ? catalogues.products : field.type === 'variant' ? catalogues.products.find((product) => product._id === modalData.product)?.variants || [] : field.type === 'products' ? catalogues.products : null} onChange={(value) => setModalData((data) => ({ ...data, [field.name]: value, ...(field.name === 'product' ? { variant: '' } : {}) }))} />)}
+        {modalError && <div role="alert" className="notice error-notice modal-error">{modalError}</div>}
+        {fields[modal].filter((field) => !(editingId && field.name === 'password')).map((field) => <FormInput key={field.name} field={field} value={modalData[field.name]} options={field.type === 'customer' ? catalogues.customers : field.type === 'plan' ? catalogues.plans : field.type === 'invoice' ? catalogues.invoices : field.type === 'product' ? catalogues.products : field.type === 'variant' ? catalogues.products.find((product) => product._id === modalData.product)?.variants || [] : field.type === 'products' ? catalogues.products : null} onChange={(value) => setModalData((data) => ({ ...data, [field.name]: value, ...(modal === 'payment' ? { requestKey: crypto.randomUUID() } : {}), ...(field.name === 'product' ? { variant: '' } : {}) }))} />)}
         <div className="modal-actions"><button type="button" className="button secondary" onClick={() => setModal('')}>Cancel</button><button className="button primary" disabled={busy}>{busy ? 'Saving…' : modal === 'payment' ? 'Record payment' : modal === 'portalSubscribe' ? 'Start subscription' : 'Save'} <ArrowUpRight size={15} /></button></div>
       </form>
     </Modal>}
+    {documentRecord && <Modal title="Billing document" subtitle="Review line items, taxes and balances." onClose={() => setDocumentRecord(null)}><DocumentView {...documentRecord} /></Modal>}
     {requestReview && <Modal
       title={`${requestReview.decision === 'approved' ? 'Approve' : 'Reject'} customer request`}
       subtitle={`${titleCase(requestReview.request.type)} request for ${requestReview.subscription.number}`}
@@ -477,17 +497,39 @@ function FormInput({ field, value, options, onChange }) {
   if (field.type === 'checkbox') return <label className="checkbox-field"><input type="checkbox" checked={Boolean(value)} onChange={(event) => onChange(event.target.checked)} /><span>{field.label}</span></label>;
   if (field.type === 'textarea') return <label className="field"><span>{field.label}</span><textarea rows="3" value={value ?? ''} onChange={(event) => onChange(event.target.value)} placeholder={field.placeholder} /></label>;
   if (field.type === 'products') return <label className="field"><span>{field.label}</span><select multiple value={value || []} onChange={(event) => onChange(Array.from(event.target.selectedOptions, (option) => option.value))}>{(options || []).map((option) => <option key={option._id} value={option._id}>{option.name}</option>)}</select><small className="field-hint">Select multiple products with Ctrl or Command.</small></label>;
-  if (field.type === 'select' || options) return <label className="field"><span>{field.label}{field.required && <i> *</i>}</span><select required={field.required} value={value ?? ''} onChange={(event) => onChange(event.target.value)}><option value="">Select…</option>{(options || field.options || []).map((option) => <option key={option._id || option} value={option._id || option}>{option.name ? `${option.name}${option.frequency ? ` · ${option.frequency}` : ''}${option.outstanding !== undefined ? ` · ${money(option.outstanding)} due` : ''}` : titleCase(option)}</option>)}</select></label>;
-  return <label className="field"><span>{field.label}{field.required && <i> *</i>}</span><input type={field.type || 'text'} required={field.required} min={field.type === 'number' ? '0' : undefined} step={field.type === 'number' ? 'any' : undefined} placeholder={field.placeholder} value={value ?? ''} onChange={(event) => onChange(event.target.value)} /></label>;
+  if (field.type === 'select' || options) return <label className="field"><span>{field.label}{field.required && <i> *</i>}</span><select required={field.required} value={value ?? ''} onChange={(event) => onChange(event.target.value)}><option value="">Select…</option>{(options || field.options || []).map((option) => {
+    const text = typeof option === 'string';
+    const key = text ? option : option._id || option.name;
+    const optionValue = field.type === 'variant' ? option.name : text ? option : option._id;
+    const label = text ? titleCase(option) : option.name || option.number;
+    return <option key={key} value={optionValue}>{label}{option.frequency ? ' · ' + option.frequency : ''}{option.outstanding !== undefined ? ' · ' + money(option.outstanding) + ' due' : ''}</option>;
+  })}</select></label>;
+  const integer = ['quantity', 'minimumQuantity', 'usageLimit', 'validityDays'].includes(field.name);
+  return <label className="field"><span>{field.label}{field.required && <i> *</i>}</span><input type={field.type || 'text'} required={field.required} min={field.type === 'number' ? integer ? '1' : '0' : undefined} step={field.type === 'number' ? integer ? '1' : '0.01' : undefined} placeholder={field.placeholder} value={value ?? ''} onChange={(event) => onChange(event.target.value)} /></label>;
 }
 
 function Modal({ title, subtitle, onClose, children }) {
+  const dialog = useRef(null);
   useEffect(() => {
-    const handler = (event) => { if (event.key === 'Escape') onClose(); };
+    const previous = document.activeElement;
+    const first = dialog.current?.querySelector('input, select, textarea, button');
+    first?.focus();
+    return () => { if (previous?.isConnected) previous.focus(); };
+  }, []);
+  useEffect(() => {
+    const handler = (event) => {
+      if (event.key === 'Escape') onClose();
+      if (event.key !== 'Tab') return;
+      const controls = Array.from(dialog.current?.querySelectorAll('button, input, select, textarea, a[href]') || []).filter((element) => !element.disabled && element.getClientRects().length);
+      const first = controls[0];
+      const last = controls[controls.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+    };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
   }, [onClose]);
-  return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-heading">
+  return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section ref={dialog} className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-heading">
     <div className="modal-heading"><div><p className="eyebrow page-eyebrow">SUBSIGHT WORKSPACE</p><h2 id="modal-heading">{title}</h2><p>{subtitle}</p></div><button className="icon-button" onClick={onClose} aria-label="Close dialog"><X size={18} /></button></div>
     {children}
   </section></div>;
@@ -548,7 +590,7 @@ function CustomerDashboard({ data }) {
   </div>;
 }
 
-function ListPage({ config, rows, busy, query, setQuery, role, page, onAction, onSubscriptionAction, onPayment, onSubscribe, onToggle, onReviewRequest }) {
+function ListPage({ config, rows, busy, query, setQuery, role, page, onAction, onSubscriptionAction, onPayment, onSubscribe, onToggle, onReviewRequest, onEdit, onDocument, onInvoiceStatus }) {
   const customer = role === 'customer';
   const canManage = role === 'admin' || role === 'staff';
   const canReviewRequests = ['admin', 'staff'].includes(role);
@@ -556,8 +598,13 @@ function ListPage({ config, rows, busy, query, setQuery, role, page, onAction, o
     ? rows.flatMap((subscription) => (subscription.requests || []).map((request) => ({ subscription, request })))
       .sort((a, b) => new Date(b.request.requestedAt) - new Date(a.request.requestedAt))
     : [];
-  const canToggle = role === 'admin' && ['customers', 'team', 'products', 'plans', 'discounts', 'taxes'].includes(page);
-  const hasActionColumn = page === 'subscriptions' || page === 'invoices' || page === 'quotations' || (page === 'plans' && customer) || canToggle;
+  const canToggle = page === 'customers' && canManage || role === 'admin' && ['team', 'products', 'plans', 'discounts', 'taxes'].includes(page);
+  const canEdit = canToggle;
+  const [tablePage, setTablePage] = useState(1);
+  const pageCount = Math.max(1, Math.ceil(rows.length / 25));
+  const currentPage = Math.min(tablePage, pageCount);
+  const visibleRows = rows.slice((currentPage - 1) * 25, currentPage * 25);
+  const hasActionColumn = page === 'subscriptions' || page === 'invoices' || page === 'quotations' || (page === 'plans' && customer) || canToggle || canEdit || ['invoices', 'quotations'].includes(page);
   const actions = (row) => {
     if (page === 'subscriptions') {
       if (customer) {
@@ -580,16 +627,21 @@ function ListPage({ config, rows, busy, query, setQuery, role, page, onAction, o
   return <div className="list-page-stack">
   {page === 'subscriptions' && <CustomerRequestsPanel requests={requestRows} customer={customer} canReview={canReviewRequests} onReview={onReviewRequest} />}
   <section className="panel table-panel">
-    <div className="table-toolbar"><div className="table-count">{rows.length} {rows.length === 1 ? 'record' : 'records'}</div><label className="table-search"><Search size={15} /><input placeholder={`Search ${config.title.toLowerCase()}…`} value={query} onChange={(event) => setQuery(event.target.value)} /><kbd>⌘ K</kbd></label></div>
+    <div className="table-toolbar"><div className="table-count">{rows.length} {rows.length === 1 ? 'record' : 'records'}</div><label className="table-search"><Search size={15} /><input placeholder={`Search ${config.title.toLowerCase()}…`} value={query} onChange={(event) => { setQuery(event.target.value); setTablePage(1); }} /><kbd>⌘ K</kbd></label></div>
     {rows.length ? <div className="table-scroll"><table><thead><tr>{config.columns.map(([, label]) => <th key={label}>{label}</th>)}{hasActionColumn && <th className="actions-head">Action</th>}</tr></thead><tbody>
-      {rows.map((row) => <tr key={row._id}>{config.columns.map(([path, , type]) => {
+      {visibleRows.map((row) => <tr key={row._id}>{config.columns.map(([path, , type]) => {
         let value = path.split('.').reduce((result, part) => result?.[part], row);
         return <td key={path} className={type === 'money' ? 'money-cell' : ''}>
-          {type === 'money' ? money(value) : type === 'date' ? date(value) : type === 'status' ? <Status value={value} /> : type === 'boolean' ? <span className={`availability ${value ? 'is-active' : ''}`}><i />{value ? 'Active' : 'Inactive'}</span> : type === 'discountValue' ? (row.kind === 'percentage' ? `${value}%` : money(value)) : type === 'percent' ? `${value}%` : value || <span className="muted-value">—</span>}
+          {type === 'money' ? money(value) : type === 'date' ? date(value) : type === 'status' ? <Status value={value} /> : type === 'boolean' ? <span className={`availability ${value ? 'is-active' : ''}`}><i />{value ? 'Active' : 'Inactive'}</span> : type === 'discountValue' ? (row.kind === 'percentage' ? `${value}%` : money(value)) : type === 'percent' ? `${value}%` : value ?? <span className="muted-value">—</span>}
         </td>;
-      })}{hasActionColumn && <td className="row-action-cell">{actions(row)}</td>}</tr>)}
+      })}{hasActionColumn && <td className="row-action-cell">{<div className="row-actions">
+          {['invoices', 'quotations'].includes(page) && <button className="small-action" onClick={() => onDocument(row)}>View / print</button>}
+          {canEdit && <button className="small-action" onClick={() => onEdit(row)}>Edit</button>}
+          {actions(row)}
+          {page === 'invoices' && canManage && row.paidAmount === 0 && ['draft', 'confirmed'].includes(row.status) && <button className="small-action reject-action" onClick={() => onInvoiceStatus(row, 'cancelled')}>Cancel invoice</button>}
+        </div>}</td>}</tr>)}
     </tbody></table></div> : <EmptyState title={query ? 'No matching records' : `No ${config.title.toLowerCase()} yet`} description={query ? 'Try another search term.' : page === 'subscriptions' ? 'Subscriptions will appear once a plan is started.' : page === 'invoices' ? 'Invoices are created when subscriptions are billed.' : page === 'payments' ? 'Recorded payments will appear here.' : page === 'plans' ? 'Available plans will appear here.' : 'New records will appear here when they are created.'} />}
-    <div className="table-footer"><span>Showing {rows.length} {rows.length === 1 ? 'record' : 'records'}</span><span>SubSight records update as changes are saved.</span></div>
+    <div className="table-footer"><span>Showing {rows.length ? (currentPage - 1) * 25 + 1 : 0}–{Math.min(currentPage * 25, rows.length)} of {rows.length} records</span><div className="row-actions"><button className="small-action" disabled={currentPage === 1} onClick={() => setTablePage(currentPage - 1)}>Previous</button><span>Page {currentPage} of {pageCount}</span><button className="small-action" disabled={currentPage === pageCount} onClick={() => setTablePage(currentPage + 1)}>Next</button></div></div>
   </section></div>;
 }
 
@@ -634,25 +686,38 @@ function ProfilePanel({ user, onSave }) {
 
 function AppFrame() {
   const [user, setUser] = useState(null);
-  const [showLanding, setShowLanding] = useState(true);
   const [checking, setChecking] = useState(Boolean(localStorage.getItem('subsight-token')));
+  const [sessionError, setSessionError] = useState('');
+  const [attempt, setAttempt] = useState(0);
   const location = useLocation();
+  const navigate = useNavigate();
   useEffect(() => {
     if (!localStorage.getItem('subsight-token')) return;
-    request('get', '/auth/me').then((result) => setUser(result.user)).catch(() => { localStorage.removeItem('subsight-token'); setUser(null); }).finally(() => setChecking(false));
-  }, []);
-  const navigate = useNavigate();
-  useEffect(() => { if (user && location.pathname === '/') navigate('/dashboard', { replace: true }); }, [location.pathname, navigate, user]);
-  function logout() {
-    request('post', '/auth/logout').catch(() => {});
-    localStorage.removeItem('subsight-token');
-    setUser(null);
-    navigate('/', { replace: true });
+    const controller = new AbortController();
+    request('get', '/auth/me', undefined, { signal: controller.signal })
+      .then((result) => { setUser(result.user); setSessionError(''); })
+      .catch((error) => { if (!error.cancelled && error.status !== 401) setSessionError(error.message); })
+      .finally(() => { if (!controller.signal.aborted) setChecking(false); });
+    return () => controller.abort();
+  }, [attempt]);
+  useEffect(() => {
+    const expired = () => { setUser(null); setChecking(false); setSessionError(''); navigate('/login', { replace: true }); };
+    window.addEventListener('subsight:session-expired', expired);
+    return () => window.removeEventListener('subsight:session-expired', expired);
+  }, [navigate]);
+  useEffect(() => {
+    if (user && ['/', '/login', '/register'].includes(location.pathname)) navigate('/dashboard', { replace: true });
+  }, [location.pathname, navigate, user]);
+  async function logout() {
+    try { await request('post', '/auth/logout', {}); }
+    catch { }
+    finally { localStorage.removeItem('subsight-token'); setUser(null); navigate('/', { replace: true }); }
   }
   if (checking) return <div className="initial-loader"><span className="spinner" /> Connecting to SubSight…</div>;
-  if (!user && showLanding) return <Landing onGetStarted={() => setShowLanding(false)} onSignIn={() => setShowLanding(false)} />; 
-  if (!user) return <AuthPage onLogin={setUser} />;
-  return <Workspace key={user.id} user={user} onLogout={logout} />;
+  if (sessionError && !user) return <div className="initial-loader session-error"><p role="alert">{sessionError}</p><button className="button primary" onClick={() => { setChecking(true); setSessionError(''); setAttempt((value) => value + 1); }}>Retry connection</button></div>;
+  if (!user && location.pathname === '/') return <Landing onGetStarted={() => navigate('/register')} onSignIn={() => navigate('/login')} />;
+  if (!user) return <AuthPage key={location.pathname} initialMode={location.pathname === '/register' ? 'register' : 'login'} onLogin={(value) => { setUser(value); navigate('/dashboard', { replace: true }); }} />;
+  return <Workspace key={user.id} user={user} onLogout={logout} onUserUpdate={setUser} />;
 }
 
 export default function App() {

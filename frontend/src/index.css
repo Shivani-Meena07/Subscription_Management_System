@@ -267,6 +267,40 @@ tbody tr:hover { background: #fcfdfb; }
 .auth-mobile-brand { display: none; }
 .initial-loader { display: flex; min-height: 100vh; align-items: center; justify-content: center; gap: 10px; color: #758076; font-size: 11px; background: #f8f9f6; }
 
+.report-filters { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; padding: 18px; }
+.report-filters .field { flex: 1 1 150px; }
+.panel-empty { margin: 0; padding: 20px; color: var(--ink-soft); line-height: 1.6; font-size: 11px; }
+.audit-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; padding: 20px; color: var(--ink-soft); }
+.audit-summary b { color: var(--ink); }
+.audit-summary .button { margin-left: auto; }
+.row-actions { flex-wrap: wrap; align-items: center; }
+.small-action:disabled { cursor: default; opacity: .45; }
+.modal-error { grid-column: 1 / -1; }
+.session-error { flex-direction: column; gap: 16px; padding: 25px; text-align: center; }
+.modal:has(.document-view) { width: min(850px, 100%); }
+.document-toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
+.document-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 25px; margin-bottom: 24px; }
+.document-heading h2 { margin: 8px 0; font-size: 26px; }
+.document-heading p { line-height: 1.7; }
+.document-dates { display: flex; gap: 20px; flex-wrap: wrap; padding-bottom: 20px; color: var(--ink-soft); }
+.document-view td:first-child { white-space: normal; min-width: 130px; }
+.document-totals { margin: 25px 0 25px auto; width: min(320px, 100%); }
+.document-totals div { display: flex; justify-content: space-between; gap: 20px; padding: 8px 0; }
+.document-totals dd { margin: 0; font-variant-numeric: tabular-nums; }
+.document-total { border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); font-weight: 700; }
+
+@media print {
+  @page { size: A4; margin: 15mm; }
+  body:has(.document-view) { background: white; }
+  body:has(.document-view) .sidebar, body:has(.document-view) .main-area, body:has(.document-view) .toast,
+  body:has(.document-view) .modal-heading, .document-toolbar { display: none !important; }
+  body:has(.document-view) .modal-backdrop { position: static; display: block; padding: 0; background: none; backdrop-filter: none; }
+  body:has(.document-view) .modal { width: 100%; max-height: none; overflow: visible; padding: 0; border: 0; border-radius: 0; box-shadow: none; }
+  .document-view .table-scroll { overflow: visible; }
+  .document-view table { width: 100%; }
+  .document-view tr { break-inside: avoid; }
+}
+
 @media (min-width: 1450px) {
   .page-content { padding-right: 54px; padding-left: 54px; }
   .metric-card { padding: 17px 19px; }

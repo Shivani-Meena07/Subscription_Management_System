@@ -135,15 +135,15 @@ All billing amounts are represented in Indian Rupees (INR).
 
 ### Prerequisites
 
-- Node.js 20+
+- Node.js 20.19+ or 22.12+ (Node.js 24 is supported)
 - MongoDB (local or hosted)
 - npm
 
 ### 1. Clone the repository
 
 ```bash
-git clone <your-repository-url>
-cd SubSight
+git clone https://github.com/Shivani-Meena07/Subscription_Management_System.git
+cd Subscription_Management_System
 ```
 
 ### 2. Configure environment variables
@@ -154,19 +154,24 @@ Navigate to the backend directory:
 cd backend
 ```
 
-Copy the example environment file:
+Install backend dependencies and generate local configuration and the initial admin:
 
 ```bash
-cp .env.example .env
+npm install
+npm run setup
 ```
 
-Configure the following variables in `backend/.env`:
+Setup creates a private random JWT secret and initial administrator password when they are missing. Read `ADMIN_EMAIL` and `ADMIN_PASSWORD` in the ignored `backend/.env` file to sign in. Existing accounts and their passwords are not overwritten. MongoDB must be running; edit `MONGODB_URI` first when using a hosted database.
+
+Configuration in `backend/.env`:
 
 | Variable | Purpose |
 |---|---|
 | `MONGODB_URI` | MongoDB connection string |
 | `JWT_SECRET` | Private authentication secret (minimum 32 characters) |
 | `ADMIN_PASSWORD` | Initial administrator password |
+| `HOST` | Listening address; defaults to `127.0.0.1` |
+| `BILLING_TIMEZONE` | Daily billing timezone; defaults to `Asia/Kolkata` |
 | `SMTP_*` | SMTP configuration for password reset emails |
 
 ### 3. Install dependencies and initialise the database
@@ -176,7 +181,7 @@ npm install
 npm run seed
 ```
 
-The seed command creates the configured initial administrator account.
+The seed command creates the configured initial administrator account. Use it when you have configured `.env` manually; `npm run setup` already runs this step. In PowerShell, use `npm.cmd` if the `npm.ps1` execution policy blocks the `npm` command.
 
 ### 4. Start the backend
 
@@ -212,6 +217,44 @@ npm test
 ```
 
 Set `TEST_MONGODB_URI` to a disposable MongoDB test instance to run the API integration tests; without it, those tests are skipped. The frontend can be checked with `cd frontend && npm run lint && npm run build`.
+
+PowerShell example:
+
+```powershell
+cd backend
+$env:TEST_MONGODB_URI = 'mongodb://127.0.0.1:27017'
+npm.cmd test
+```
+
+The test suite creates a randomly named database and deletes only that database during cleanup. It does not clear your configured application database.
+
+## Completed Application Workflows
+
+- Admin and staff can create, edit and deactivate customer login accounts used by the same subscription and billing APIs.
+- Admins can edit products, variants, plans, taxes, discounts and team member names. Staff can read the catalogue, manage customers, subscriptions, quotations, invoices and payment records, and review customer requests.
+- All list screens load complete API pagination and provide searchable, 25-row pages. Dropdown lists are not limited to the first 50 records.
+- Invoice and quotation details show captured line prices, discounts, tax, paid amounts and balances, with browser printing / Save as PDF.
+- Reports provide date-filtered revenue, invoiced totals, top customers, monthly revenue and CSV exports. Report date boundaries and monthly grouping use Indian time. Current outstanding balances and active subscriptions are explicitly separate from date-filtered totals.
+- Audit & checks provides activity history, payment synchronization and read-only consistency checks against invoice balances. Activity logging is best-effort and excludes passwords, tokens and request bodies; it is not a compliance-grade audit trail.
+- Expired login sessions return users to sign-in. A temporary network failure during session restoration preserves the token and offers a retry. Profile name changes update the workspace immediately.
+
+## Billing Reliability
+
+Monthly/yearly date arithmetic clamps to the last day available in the target month. Subsequent periods advance from the stored billing date. A daily job runs at 02:00 in `BILLING_TIMEZONE`; manual billing and the job share the same service. One run catches up at most 365 periods per subscription and reports how many subscriptions remain due. The backend must be running for scheduled work to execute.
+
+New invoice lines capture prices and tax rates. Existing subscription lines continue billing from their saved values even when a referenced catalogue product is removed. Zero-value invoices are settled immediately. Paused subscriptions are not billed; resuming advances an overdue next-billing date to the resume time. Renewing a subscription with an expiry date establishes a new expiry one billing period ahead.
+
+Manual payments use an invoice-embedded payment journal: the amount, payment entry and invoice status are saved in one atomic MongoDB document update. Payment history is a recoverable projection of those saved entries. A failed history write keeps the committed entry; startup, periodic synchronization, financial reads or the Audit screen can repair it. Synchronization runs every minute while the backend is up.
+
+The UI generates a `requestKey` for each payment submission and retains it for retries. API clients must resend the same `requestKey` (or `Idempotency-Key` header) for retries of the same payment. Reusing a key with different details returns `409`. Requests without a key are treated as new payments. Older invoices and payment records remain readable; pre-existing inconsistencies are reported, not silently rewritten.
+
+## Production Build
+
+Build `frontend` with `npm run build`, then start the backend with `NODE_ENV=production`. It serves the built UI and React route fallback from the same origin. Set `HOST=0.0.0.0` only when the application should listen beyond the local machine; configure HTTPS and deployment-specific network access on your hosting platform. Keep `.env` private.
+
+This completes the repository's local MVP workflows. Real automatic payment collection, payment-provider webhooks and refunds need a payment provider and credentials; this application records payments manually. Password reset email delivery is implemented through Nodemailer but requires valid `SMTP_*` configuration. No live gateway charge or external email delivery has been simulated as a successful production integration.
+
+For the implementation review and verification details, see [completion notes](docs/COMPLETION.md).
 
 ---
 
