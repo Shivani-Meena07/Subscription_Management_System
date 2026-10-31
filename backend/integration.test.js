@@ -13,8 +13,10 @@ describe('backend API with an isolated MongoDB database', { skip: !process.env.T
   let server;
   let baseUrl;
   let admin;
+  let staff;
   let customer;
   let adminToken;
+  let staffToken;
   let customerToken;
   const password = 'TestPassword!42';
 
@@ -53,11 +55,13 @@ describe('backend API with an isolated MongoDB database', { skip: !process.env.T
 
   beforeEach(async () => {
     await Promise.all(Object.values(mongoose.models).map((Model) => Model.deleteMany({})));
-    [admin, customer] = await User.create([
+    [admin, staff, customer] = await User.create([
       { name: 'Test Admin', email: 'admin@example.test', password, role: 'admin' },
+      { name: 'Test Staff', email: 'staff@example.test', password, role: 'staff' },
       { name: 'Test Customer', email: 'customer@example.test', password, role: 'customer' }
     ]);
     adminToken = sign(admin);
+    staffToken = sign(staff);
     customerToken = sign(customer);
   });
 
@@ -86,6 +90,116 @@ describe('backend API with an isolated MongoDB database', { skip: !process.env.T
     }
     assert.equal(await Subscription.countDocuments(), 0);
     assert.equal(await Invoice.countDocuments(), 0);
+  });
+
+  test('customers can submit requests once and customer request history stays isolated', async () => {
+    const subscription = await subscriptionFor();
+    const request = await call('PATCH', `/subscriptions/${subscription.id}/action`, { action: 'pause-request' }, customerToken);
+    assert.equal(request.status, 201);
+    assert.match(request.body.message, /stays active until the request is approved/);
+    assert.equal(request.body.request.status, 'pending');
+    assert.ok(request.body.request.requestedAt);
+    assert.equal((await Subscription.findById(subscription._id)).status, 'active');
+    assert.equal((await call('PATCH', `/subscriptions/${subscription.id}/action`, { action: 'pause-request' }, customerToken)).status, 409);
+    const adminList = await call('GET', '/subscriptions');
+    assert.equal(adminList.status, 200);
+    assert.equal(adminList.body.items[0].requests[0].status, 'pending');
+    assert.equal(adminList.body.items[0].customer.email, customer.email);
+    assert.equal(adminList.body.items[0].plan.name, 'Monthly plan');
+
+    const other = await User.create({ name: 'Other Customer', email: 'other-requests@example.test', password });
+    const otherToken = sign(other);
+    const list = await call('GET', '/subscriptions', undefined, otherToken);
+    assert.equal(list.status, 200);
+    assert.equal(list.body.total, 0);
+    assert.equal((await call('PATCH', `/subscriptions/${subscription.id}/action`, { action: 'cancel-request' }, otherToken)).status, 404);
+  });
+
+  test('concurrent duplicate customer requests create only one pending request', async () => {
+    const subscription = await subscriptionFor();
+    const submit = () => call('PATCH', `/subscriptions/${subscription.id}/action`, { action: 'pause-request' }, customerToken);
+    const results = await Promise.all([submit(), submit()]);
+    assert.deepEqual(results.map((result) => result.status).sort(), [201, 409]);
+    assert.equal(await Subscription.countDocuments({ _id: subscription._id, 'requests.type': 'pause', 'requests.status': 'pending' }), 1);
+  });
+
+  test('admin and staff can approve requests once, while customers cannot review them', async () => {
+    const subscription = await subscriptionFor();
+    const submitted = await call('PATCH', `/subscriptions/${subscription.id}/action`, { action: 'pause-request' }, customerToken);
+    const path = `/subscriptions/${subscription.id}/requests/${submitted.body.request._id}`;
+    assert.equal((await call('PATCH', path, { status: 'approved' }, customerToken)).status, 403);
+    const approved = await call('PATCH', path, { status: 'approved' }, staffToken);
+    assert.equal(approved.status, 200);
+    assert.equal(approved.body.item.status, 'paused');
+    assert.equal(approved.body.request.status, 'approved');
+    assert.ok(approved.body.request.reviewedAt);
+    assert.equal(String(approved.body.request.reviewedBy), staff.id);
+    assert.equal((await call('PATCH', path, { status: 'approved' }, adminToken)).status, 409);
+  });
+
+  test('rejecting a request retains its history without changing subscription status', async () => {
+    const subscription = await subscriptionFor();
+    const submitted = await call('PATCH', `/subscriptions/${subscription.id}/action`, { action: 'pause-request' }, customerToken);
+    const path = `/subscriptions/${subscription.id}/requests/${submitted.body.request._id}`;
+    const rejected = await call('PATCH', path, { status: 'rejected' });
+    assert.equal(rejected.status, 200);
+    assert.equal(rejected.body.item.status, 'active');
+    assert.equal(rejected.body.request.status, 'rejected');
+    assert.ok(rejected.body.request.reviewedAt);
+    assert.equal((await Subscription.findById(subscription._id)).requests.length, 1);
+    assert.equal((await call('PATCH', path, { status: 'approved' })).status, 409);
+  });
+
+  test('request review validates types, IDs and pending states', async () => {
+    const subscription = await subscriptionFor();
+    assert.equal((await call('PATCH', `/subscriptions/${subscription.id}/requests/not-an-id`, { status: 'approved' })).status, 400);
+    assert.equal((await call('PATCH', `/subscriptions/${subscription.id}/requests/${new mongoose.Types.ObjectId()}`, { status: 'approved' })).status, 404);
+    assert.equal((await call('PATCH', `/subscriptions/${subscription.id}/action`, { action: 'unknown-request' }, customerToken)).status, 403);
+    const submitted = await call('PATCH', `/subscriptions/${subscription.id}/action`, { action: 'pause-request' }, customerToken);
+    const reviewPath = `/subscriptions/${subscription.id}/requests/${submitted.body.request._id}`;
+    assert.equal((await call('PATCH', reviewPath, { status: 'pending' })).status, 400);
+  });
+
+  test('cancellation approval follows early-close and expiry rules', async () => {
+    const subscription = await subscriptionFor({ expiryDate: new Date(Date.now() + 86400000) });
+    await Plan.updateOne({ _id: subscription.plan }, { $set: { allowEarlyClose: false } });
+    const submitted = await call('PATCH', `/subscriptions/${subscription.id}/action`, { action: 'cancel-request' }, customerToken);
+    assert.equal(submitted.status, 201);
+    const path = `/subscriptions/${subscription.id}/requests/${submitted.body.request._id}`;
+    assert.equal((await call('PATCH', path, { status: 'approved' })).status, 409);
+
+    await Subscription.updateOne({ _id: subscription._id }, { $set: { expiryDate: new Date(Date.now() - 86400000) } });
+    const approved = await call('PATCH', path, { status: 'approved' });
+    assert.equal(approved.status, 200);
+    assert.equal(approved.body.item.status, 'closed');
+  });
+
+  test('renewal requires an enabled plan and closed or expired subscription', async () => {
+    const active = await subscriptionFor();
+    assert.equal((await call('PATCH', `/subscriptions/${active.id}/action`, { action: 'renew-request' }, customerToken)).status, 400);
+
+    await Subscription.updateOne({ _id: active._id }, { $set: { status: 'closed' } });
+    await Plan.updateOne({ _id: active.plan }, { $set: { allowRenewal: false } });
+    assert.equal((await call('PATCH', `/subscriptions/${active.id}/action`, { action: 'renew-request' }, customerToken)).status, 400);
+
+    await Plan.updateOne({ _id: active.plan }, { $set: { allowRenewal: true } });
+    const submitted = await call('PATCH', `/subscriptions/${active.id}/action`, { action: 'renew-request' }, customerToken);
+    assert.equal(submitted.status, 201);
+    const path = `/subscriptions/${active.id}/requests/${submitted.body.request._id}`;
+    const before = Date.now();
+    const approved = await call('PATCH', path, { status: 'approved' });
+    assert.equal(approved.status, 200);
+    assert.equal(approved.body.item.status, 'active');
+    assert.ok(new Date(approved.body.item.nextBillingDate).getTime() >= before);
+  });
+
+  test('pause requests require pause-enabled plans and current active status', async () => {
+    const subscription = await subscriptionFor();
+    await Plan.updateOne({ _id: subscription.plan }, { $set: { allowPause: false } });
+    assert.equal((await call('PATCH', `/subscriptions/${subscription.id}/action`, { action: 'pause-request' }, customerToken)).status, 400);
+    await Plan.updateOne({ _id: subscription.plan }, { $set: { allowPause: true } });
+    await Subscription.updateOne({ _id: subscription._id }, { $set: { status: 'paused' } });
+    assert.equal((await call('PATCH', `/subscriptions/${subscription.id}/action`, { action: 'pause-request' }, customerToken)).status, 400);
   });
 
   test('literal catalog searches and malformed pagination remain usable', async () => {
@@ -247,6 +361,15 @@ describe('backend API with an isolated MongoDB database', { skip: !process.env.T
     const login = await call('POST', '/auth/login', { email: customer.email, password }, null);
     assert.equal(login.status, 200);
     assert.equal((await call('GET', '/auth/me', undefined, login.body.token)).status, 200);
+  });
+
+  test('registration cannot choose an internal role and returns an authenticated customer session', async () => {
+    const registration = await call('POST', '/auth/register', {
+      name: 'New Customer', email: 'new@example.test', password: 'NewCustomer!42', role: 'admin'
+    }, null);
+    assert.equal(registration.status, 201);
+    assert.equal(registration.body.user.role, 'customer');
+    assert.equal((await call('GET', '/auth/me', undefined, registration.body.token)).status, 200);
   });
 
   test('password reset tokens are single-use, private and invalidate old sessions', async () => {

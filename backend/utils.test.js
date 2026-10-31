@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { addPeriod, escapeSearch, makeNumber, pageResult, passwordValid, quantityFor } from './utils.js';
+import { approvedRequestUpdate, requestEligibility, requestResponseMessage } from './subscriptionRequests.js';
+import { Subscription } from './models.js';
 
 test('password policy requires length, case, and a special character', () => {
   assert.equal(passwordValid('GoodPass!42'), true);
@@ -51,4 +53,58 @@ test('catalog searches treat regex characters as literal text', () => {
     assert.equal(search.test(value), true);
     assert.equal(search.test('unrelated'), false);
   }
+});
+
+test('pause requests require an eligible active subscription and plan', () => {
+  const subscription = { status: 'active', plan: { allowPause: true } };
+  assert.equal(requestEligibility(subscription, 'pause'), null);
+  assert.match(requestEligibility({ ...subscription, status: 'paused' }, 'pause'), /Only active/);
+  assert.match(requestEligibility({ status: 'active', plan: { allowPause: false } }, 'pause'), /not allowed/);
+  assert.deepEqual(approvedRequestUpdate(subscription, 'pause').update, { status: 'paused' });
+});
+
+test('cancellation requests respect plan closure and subscription state', () => {
+  const subscription = { status: 'active', plan: { allowEarlyClose: false }, expiryDate: new Date('2027-01-01') };
+  const now = new Date('2026-01-01');
+  assert.equal(requestEligibility(subscription, 'cancel', now), null);
+  assert.match(approvedRequestUpdate(subscription, 'cancel', now).error, /before its expiry/);
+  assert.equal(requestEligibility({ ...subscription, expiryDate: new Date('2025-01-01') }, 'cancel', new Date('2026-01-01')), null);
+  assert.deepEqual(approvedRequestUpdate({ status: 'paused', plan: { allowEarlyClose: true } }, 'cancel').update, { status: 'closed' });
+});
+
+test('renewal is limited to enabled plans and closed or expired subscriptions', () => {
+  const active = { status: 'active', plan: { allowRenewal: true, active: true } };
+  assert.match(requestEligibility(active, 'renew'), /Only closed or expired/);
+  const disabled = { status: 'closed', plan: { allowRenewal: false, active: true } };
+  assert.match(requestEligibility(disabled, 'renew'), /not allowed/);
+  const expired = { status: 'expired', plan: { allowRenewal: true, active: true } };
+  const now = new Date('2026-10-31T00:00:00Z');
+  assert.equal(requestEligibility(expired, 'renew', now), null);
+  assert.deepEqual(approvedRequestUpdate(expired, 'renew', now).update, { status: 'active', nextBillingDate: now });
+});
+
+test('unsupported requests and request confirmations are explicit', () => {
+  assert.match(requestEligibility({ status: 'active', plan: {} }, 'archive'), /valid request type/);
+  assert.match(requestResponseMessage('pause'), /stays active/);
+  assert.match(requestResponseMessage('cancel'), /stays unchanged/);
+  assert.match(requestResponseMessage('renew'), /closed or expired/);
+});
+
+test('subscription request subdocuments retain status, timestamps, reviewer and stable IDs', () => {
+  const subscription = new Subscription({
+    number: 'SUB-schema-test',
+    customer: '507f1f77bcf86cd799439011',
+    plan: '507f191e810c19729de860ea',
+    frequency: 'monthly',
+    total: 100,
+    requests: [{ type: 'pause' }]
+  });
+  const request = subscription.requests[0];
+  assert.ok(request.id);
+  assert.equal(request.status, 'pending');
+  assert.ok(request.requestedAt instanceof Date);
+  request.status = 'approved';
+  request.reviewedAt = new Date();
+  request.reviewedBy = '507f1f77bcf86cd799439012';
+  assert.equal(request.validateSync(), undefined);
 });

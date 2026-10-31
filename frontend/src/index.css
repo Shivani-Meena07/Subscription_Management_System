@@ -152,6 +152,20 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .welcome-stamp { display: flex; align-items: center; gap: 8px; padding: 9px 11px; border: 1px solid #dce6dc; border-radius: 5px; background: #f9fbf8; color: #64816b; font-size: 9px; }
 
 .table-panel { min-height: 260px; }
+.list-page-stack { display: flex; flex-direction: column; gap: 14px; }
+.request-panel { border-color: #e1e8e1; }
+.request-heading { min-height: 61px; }
+.request-heading h2 { display: flex; align-items: center; gap: 7px; }
+.request-count { flex: none; padding: 5px 8px; border: 1px solid #f0dfc7; border-radius: 4px; background: #fbf5eb; color: #947344; font-size: 9px; font-weight: 650; }
+.requests-table td { height: 45px; }
+.request-number { color: #465d4a; font-weight: 630; }
+.reviewed-note { color: #929990; font-size: 9px; }
+.request-confirmation { padding: 12px 13px; border: 1px solid #e8ece6; border-radius: 5px; background: #fafbf9; color: #707970; font-size: 10px; line-height: 1.65; }
+.request-confirmation p { margin: 0; }
+.request-confirmation p + p { margin-top: 8px; }
+.request-confirmation b { color: #3c493f; font-weight: 650; }
+.button.danger { border-color: #a9635b; background: #a9635b; color: #fff; }
+.button.danger:hover:not(:disabled) { border-color: #8c4d46; background: #8c4d46; }
 .table-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 15px; min-height: 54px; padding: 9px 16px; border-bottom: 1px solid #ecefea; }
 .table-count { color: #8a9289; font-size: 10px; }
 .table-search { display: flex; width: min(250px, 60%); align-items: center; gap: 7px; height: 30px; padding: 0 8px; border: 1px solid #e8ebe6; border-radius: 4px; color: #929990; }

@@ -1,5 +1,4 @@
 import 'dotenv/config';
-import authRoutes from './routes/authRoutes.js';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -15,17 +14,14 @@ import { authenticate, allow } from './middleware/auth.js';
 import { Discount, Invoice, Payment, Plan, Product, Quotation, Subscription, Tax, User } from './models.js';
 import { addPeriod, escapeSearch, makeNumber, pageResult, passwordValid, quantityFor, round } from './utils.js';
 import { recordPayment } from './payments.js';
+import { approvedRequestUpdate, customerRequestTypes, requestEligibility, requestResponseMessage } from './subscriptionRequests.js';
 
-require('dotenv').config();
 
 const app = express();
 app.use(helmet());
 app.use(cors({ origin: process.env.CLIENT_ORIGIN?.split(',') ?? 'http://localhost:5173' }));
 app.use(express.json({ limit: '1mb' }));
 app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, limit: 50, standardHeaders: true, legacyHeaders: false }));
-
-app.use(express.json());
-app.use('/api/auth', authRoutes);
 
 const asyncRoute = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const objectId = (value) => mongoose.isObjectIdOrHexString(value);
@@ -230,7 +226,7 @@ app.get('/api/subscriptions', authenticate, asyncRoute(async (req, res) => {
   const filter = scopeCustomer({}, req.user);
   if (req.query.status) filter.status = req.query.status;
   const { page, limit } = pageResult(req.query);
-  const [items, total] = await Promise.all([Subscription.find(filter).populate('customer', 'name email').populate('plan', 'name frequency allowPause allowRenewal allowEarlyClose autoClose').sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit), Subscription.countDocuments(filter)]);
+  const [items, total] = await Promise.all([Subscription.find(filter).populate('customer', 'name email').populate('plan', 'name frequency allowPause allowRenewal allowEarlyClose autoClose active startDate endDate').populate('requests.reviewedBy', 'name').sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit), Subscription.countDocuments(filter)]);
   res.json({ items, total, page, pages: Math.ceil(total / limit) });
 }));
 app.post('/api/subscriptions', authenticate, allow('admin', 'staff'), asyncRoute(async (req, res) => {
@@ -271,12 +267,37 @@ app.patch('/api/subscriptions/:id/action', authenticate, asyncRoute(async (req, 
   const action = req.body.action;
   const plan = subscription.plan;
   if (req.user.role === 'customer') {
-    if (!['pause-request', 'cancel-request', 'renew-request'].includes(action)) return fail(res, 403, 'Customers can submit requests only.');
+    if (!customerRequestTypes.some((type) => `${type}-request` === action)) return fail(res, 403, 'Customers can submit requests only.');
     const type = action.replace('-request', '');
-    subscription.requests.push({ type });
+    const eligibilityError = requestEligibility(subscription, type);
+    if (eligibilityError) return fail(res, 400, eligibilityError);
+    const updated = await Subscription.findOneAndUpdate(
+      {
+        _id: subscription._id,
+        customer: req.user._id,
+        status: subscription.status,
+        requests: { $not: { $elemMatch: { type, status: 'pending' } } }
+      },
+      { $push: { requests: { type } } },
+      { new: true, runValidators: true }
+    );
+    if (!updated) {
+      const current = await Subscription.findOne({ _id: subscription._id, customer: req.user._id });
+      if (!current) return fail(res, 404, 'Subscription not found.');
+      if (current.requests.some((request) => request.type === type && request.status === 'pending')) {
+        return fail(res, 409, `A ${type} request is already pending for this subscription.`);
+      }
+      return fail(res, 409, 'The subscription changed. Refresh and try again.');
+    }
+    const request = updated.requests[updated.requests.length - 1];
+    return res.status(201).json({
+      item: updated,
+      request,
+      message: requestResponseMessage(type)
+    });
   } else if (action === 'pause' && plan?.allowPause && subscription.status === 'active') subscription.status = 'paused';
   else if (action === 'resume' && subscription.status === 'paused') subscription.status = 'active';
-  else if (action === 'close' && (plan?.allowEarlyClose || subscription.expiryDate <= new Date())) subscription.status = 'closed';
+  else if (action === 'close' && (plan?.allowEarlyClose || (subscription.expiryDate && subscription.expiryDate <= new Date()))) subscription.status = 'closed';
   else if (action === 'activate' && ['draft', 'confirmed'].includes(subscription.status)) subscription.status = 'active';
   else if (action === 'renew' && plan?.allowRenewal && ['closed', 'expired'].includes(subscription.status)) {
     subscription.status = 'active';
@@ -284,6 +305,52 @@ app.patch('/api/subscriptions/:id/action', authenticate, asyncRoute(async (req, 
   } else return fail(res, 400, 'That action is not available for this subscription or plan.');
   await subscription.save();
   res.json({ item: subscription, message: req.user.role === 'customer' ? 'Your request has been sent for review.' : 'Subscription updated.' });
+}));
+
+app.patch('/api/subscriptions/:id/requests/:requestId', authenticate, allow('admin', 'staff'), asyncRoute(async (req, res) => {
+  if (!mongoose.isObjectIdOrHexString(req.params.requestId)) return fail(res, 400, 'Invalid request ID.');
+  const parsed = z.object({ status: z.enum(['approved', 'rejected']) }).safeParse(req.body);
+  if (!parsed.success) return fail(res, 400, 'Request status must be approved or rejected.');
+
+  const subscription = await Subscription.findById(req.params.id).populate('plan');
+  if (!subscription) return fail(res, 404, 'Subscription not found.');
+  const request = subscription.requests.id(req.params.requestId);
+  if (!request) return fail(res, 404, 'Customer request not found.');
+  if (request.status !== 'pending') return fail(res, 409, 'This customer request has already been processed.');
+
+  const update = {};
+  if (parsed.data.status === 'approved') {
+    const result = approvedRequestUpdate(subscription, request.type);
+    if (result.error) return fail(res, 409, result.error);
+    Object.assign(update, result.update);
+  }
+  const reviewedAt = new Date();
+  const updated = await Subscription.findOneAndUpdate(
+    {
+      _id: subscription._id,
+      ...(parsed.data.status === 'approved' ? { status: subscription.status } : {}),
+      requests: { $elemMatch: { _id: request._id, type: request.type, status: 'pending' } }
+    },
+    {
+      $set: {
+        ...update,
+        'requests.$.status': parsed.data.status,
+        'requests.$.reviewedAt': reviewedAt,
+        'requests.$.reviewedBy': req.user._id
+      }
+    },
+    { new: true, runValidators: true }
+  )
+    .populate('customer', 'name email')
+    .populate('plan', 'name frequency allowPause allowRenewal allowEarlyClose autoClose active startDate endDate')
+    .populate('requests.reviewedBy', 'name');
+  if (!updated) return fail(res, 409, 'This customer request was processed by another team member. Refresh the page.');
+  const reviewedRequest = updated.requests.id(req.params.requestId);
+  res.json({
+    item: updated,
+    request: reviewedRequest,
+    message: `The ${request.type} request was ${parsed.data.status}.`
+  });
 }));
 
 export async function generateDueInvoices() {

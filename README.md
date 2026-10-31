@@ -36,6 +36,8 @@ Manage subscriptions through structured stages:
 
 Configure billing frequencies, quantities, subscription pricing, availability dates, and lifecycle operations.
 
+Customers may submit pause, cancellation, and renewal requests from their subscription list. Admins and staff review pending requests in the **Customer requests** section on the Subscriptions page. Requests remain in the subscription history with their status, submission time, review time, and reviewer. A pending request of the same type cannot be submitted twice. Renewal is available only for closed or expired subscriptions whose plan permits renewal; cancellation approval follows the plan's early-closure and expiry rules.
+
 ### Automated Recurring Billing
 - Generate invoices from active subscriptions.
 - Run scheduled daily billing.
@@ -199,6 +201,17 @@ npm run dev
 Access the Vite development URL displayed in your terminal and sign in using the configured administrator credentials.
 
 The frontend development server proxies `/api` requests to the backend.
+
+### Tests
+
+Run backend unit tests and the optional isolated-database API tests:
+
+```bash
+cd backend
+npm test
+```
+
+Set `TEST_MONGODB_URI` to a disposable MongoDB test instance to run the API integration tests; without it, those tests are skipped. The frontend can be checked with `cd frontend && npm run lint && npm run build`.
 
 ---
 

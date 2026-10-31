@@ -83,7 +83,13 @@ const subscriptionSchema = new Schema({
   expiryDate: Date,
   nextBillingDate: { type: Date, index: true },
   status: { type: String, enum: ['draft', 'confirmed', 'active', 'paused', 'closed', 'expired'], default: 'active', index: true },
-  requests: [{ type: { type: String, enum: ['pause', 'cancel', 'renew'] }, requestedAt: { type: Date, default: Date.now }, status: { type: String, default: 'pending' } }]
+  requests: [{
+    type: { type: String, enum: ['pause', 'cancel', 'renew'], required: true },
+    requestedAt: { type: Date, default: Date.now },
+    status: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending' },
+    reviewedAt: Date,
+    reviewedBy: { type: Schema.Types.ObjectId, ref: 'User' }
+  }]
 }, { timestamps: true });
 
 const invoiceSchema = new Schema({

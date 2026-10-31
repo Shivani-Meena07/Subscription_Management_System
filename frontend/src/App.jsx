@@ -224,6 +224,8 @@ function Workspace({ user, onLogout }) {
   const [loadedPath, setLoadedPath] = useState('');
   const [modal, setModal] = useState('');
   const [modalData, setModalData] = useState({});
+  const [requestReview, setRequestReview] = useState(null);
+  const [reviewBusy, setReviewBusy] = useState(false);
   const [catalogues, setCatalogues] = useState({ customers: [], plans: [], products: [], invoices: [] });
   const [list, setList] = useState([]);
   const [filter, setFilter] = useState('');
@@ -245,7 +247,14 @@ function Workspace({ user, onLogout }) {
   const fetchList = useCallback(async (path = current) => {
     if (!config) return;
     try {
-      const { items = [] } = await request('get', config.endpoint);
+      let result = await request('get', current === 'subscriptions' ? '/subscriptions?page=1&limit=100' : config.endpoint);
+      let items = result.items || [];
+      if (current === 'subscriptions' && result.pages > 1) {
+        const pages = await Promise.all(Array.from({ length: result.pages - 1 }, (_, index) =>
+          request('get', `/subscriptions?page=${index + 2}&limit=100`)
+        ));
+        items = items.concat(...pages.map((pageResult) => pageResult.items || []));
+      }
       setList(items);
       setLoadError('');
     } catch (error) { setList([]); setLoadError(error.message); }
@@ -260,9 +269,18 @@ function Workspace({ user, onLogout }) {
     if (current !== 'dashboard' && !config) return;
     const loadPage = async () => {
       try {
-        const result = await request('get', current === 'dashboard' ? (isCustomer ? '/portal/dashboard' : '/dashboard/summary') : config.endpoint);
+        const result = await request('get', current === 'dashboard' ? (isCustomer ? '/portal/dashboard' : '/dashboard/summary') : current === 'subscriptions' ? '/subscriptions?page=1&limit=100' : config.endpoint);
         if (current === 'dashboard') setDashboard(result);
-        else setList(result.items || []);
+        else {
+          let items = result.items || [];
+          if (current === 'subscriptions' && result.pages > 1) {
+            const pages = await Promise.all(Array.from({ length: result.pages - 1 }, (_, index) =>
+              request('get', `/subscriptions?page=${index + 2}&limit=100`)
+            ));
+            items = items.concat(...pages.map((pageResult) => pageResult.items || []));
+          }
+          setList(items);
+        }
         setLoadError('');
       } catch (error) {
         if (current !== 'dashboard') setList([]);
@@ -355,6 +373,20 @@ function Workspace({ user, onLogout }) {
     } catch (error) { notify(error.message); }
   }
 
+  async function submitRequestReview(status) {
+    if (!requestReview) return;
+    setReviewBusy(true);
+    try {
+      const { subscription, request: requestRecord } = requestReview;
+      const result = await request('patch', `/subscriptions/${subscription._id}/requests/${requestRecord._id}`, { status });
+      notify(result.message);
+      setRequestReview(null);
+      fetchList();
+    } catch (error) {
+      notify(error.message);
+    } finally { setReviewBusy(false); }
+  }
+
   async function toggleRecord(item) {
     const collection = { team: 'users', customers: 'users', products: 'products', plans: 'plans', discounts: 'discounts', taxes: 'taxes' }[current];
     try {
@@ -413,7 +445,7 @@ function Workspace({ user, onLogout }) {
         {current === 'profile' && <ProfilePanel user={user} onSave={async (name) => { try { const result = await request('patch', '/profile', { name }); notify('Profile updated.'); return result.user; } catch (error) { notify(error.message); return null; } }} />}
         {config && <ListPage
           config={config} rows={filteredList} busy={loadedPath !== current && !loadError} query={filter} setQuery={setFilter} role={role} page={current}
-          onRefresh={fetchList} onAction={action} onSubscriptionAction={subscriptionAction} onToggle={toggleRecord}
+          onRefresh={fetchList} onAction={action} onSubscriptionAction={subscriptionAction} onToggle={toggleRecord} onReviewRequest={setRequestReview}
           onPayment={(invoice) => { setModalData({ invoice: invoice._id, amount: invoice.outstanding, method: 'upi' }); setModal('payment'); request('get', '/invoices').then((r) => setCatalogues((v) => ({ ...v, invoices: (r.items || []).filter((item) => item.outstanding > 0) }))).catch((error) => notify(error.message)); }}
           onSubscribe={(plan) => { setModalData({ plan: plan._id, quantity: plan.minimumQuantity || 1 }); setModal('portalSubscribe'); }}
         />}
@@ -424,6 +456,17 @@ function Workspace({ user, onLogout }) {
         {fields[modal].map((field) => <FormInput key={field.name} field={field} value={modalData[field.name]} options={field.type === 'customer' ? catalogues.customers : field.type === 'plan' ? catalogues.plans : field.type === 'invoice' ? catalogues.invoices : field.type === 'product' ? catalogues.products : field.type === 'variant' ? catalogues.products.find((product) => product._id === modalData.product)?.variants || [] : field.type === 'products' ? catalogues.products : null} onChange={(value) => setModalData((data) => ({ ...data, [field.name]: value, ...(field.name === 'product' ? { variant: '' } : {}) }))} />)}
         <div className="modal-actions"><button type="button" className="button secondary" onClick={() => setModal('')}>Cancel</button><button className="button primary" disabled={busy}>{busy ? 'Saving…' : modal === 'payment' ? 'Record payment' : modal === 'portalSubscribe' ? 'Start subscription' : 'Save'} <ArrowUpRight size={15} /></button></div>
       </form>
+    </Modal>}
+    {requestReview && <Modal
+      title={`${requestReview.decision === 'approved' ? 'Approve' : 'Reject'} customer request`}
+      subtitle={`${titleCase(requestReview.request.type)} request for ${requestReview.subscription.number}`}
+      onClose={() => { if (!reviewBusy) setRequestReview(null); }}
+    >
+      <div className="request-confirmation">
+        <p>Customer <b>{requestReview.subscription.customer?.name}</b> requested to {requestReview.request.type === 'cancel' ? 'cancel' : requestReview.request.type} this subscription on {date(requestReview.request.requestedAt)}.</p>
+        <p>{requestReview.decision === 'approved' ? 'Approving this request will update the subscription status immediately.' : 'The subscription will remain unchanged.'}</p>
+      </div>
+      <div className="modal-actions"><button type="button" className="button secondary" disabled={reviewBusy} onClick={() => setRequestReview(null)}>Go back</button><button type="button" className={`button ${requestReview.decision === 'approved' ? 'primary' : 'danger'}`} disabled={reviewBusy} onClick={() => submitRequestReview(requestReview.decision)}>{reviewBusy ? 'Processing…' : `${requestReview.decision === 'approved' ? 'Approve' : 'Reject'} request`}</button></div>
     </Modal>}
     {toast && <div className="toast"><span><Check size={16} /></span>{toast}<button onClick={() => setToast('')} aria-label="Dismiss"><X size={15} /></button></div>}
   </div>;
@@ -504,15 +547,27 @@ function CustomerDashboard({ data }) {
   </div>;
 }
 
-function ListPage({ config, rows, busy, query, setQuery, role, page, onAction, onSubscriptionAction, onPayment, onSubscribe, onToggle }) {
+function ListPage({ config, rows, busy, query, setQuery, role, page, onAction, onSubscriptionAction, onPayment, onSubscribe, onToggle, onReviewRequest }) {
   const customer = role === 'customer';
   const canManage = role === 'admin' || role === 'staff';
+  const canReviewRequests = ['admin', 'staff'].includes(role);
+  const requestRows = page === 'subscriptions'
+    ? rows.flatMap((subscription) => (subscription.requests || []).map((request) => ({ subscription, request })))
+      .sort((a, b) => new Date(b.request.requestedAt) - new Date(a.request.requestedAt))
+    : [];
   const canToggle = role === 'admin' && ['customers', 'team', 'products', 'plans', 'discounts', 'taxes'].includes(page);
   const hasActionColumn = page === 'subscriptions' || page === 'invoices' || page === 'quotations' || (page === 'plans' && customer) || canToggle;
   const actions = (row) => {
     if (page === 'subscriptions') {
-      if (customer) return <div className="row-actions">{row.status === 'active' && <button className="small-action" onClick={() => onSubscriptionAction(row, 'pause-request')}>Request pause</button>}<button className="small-action" onClick={() => onSubscriptionAction(row, 'cancel-request')}>Cancel request</button><button className="small-action" onClick={() => onSubscriptionAction(row, 'renew-request')}>Request renewal</button></div>;
-      return <select className="row-select" value="" aria-label="Subscription action" onChange={(event) => { if (event.target.value) onSubscriptionAction(row, event.target.value); }}><option value="">Actions</option>{row.status === 'active' && <option value="pause">Pause</option>}{row.status === 'paused' && <option value="resume">Resume</option>}{['draft', 'confirmed'].includes(row.status) && <option value="activate">Activate</option>}{row.status === 'active' && <option value="close">Close</option>}{['closed', 'expired'].includes(row.status) && <option value="renew">Renew</option>}</select>;
+      if (customer) {
+        const pending = new Set((row.requests || []).filter((request) => request.status === 'pending').map((request) => request.type));
+        return <div className="row-actions">
+          {row.status === 'active' && row.plan?.allowPause && !pending.has('pause') && <button className="small-action" onClick={() => onSubscriptionAction(row, 'pause-request')}>Request pause</button>}
+          {['active', 'paused'].includes(row.status) && !pending.has('cancel') && <button className="small-action reject-action" onClick={() => onSubscriptionAction(row, 'cancel-request')}>Request cancellation</button>}
+          {['closed', 'expired'].includes(row.status) && row.plan?.allowRenewal && !pending.has('renew') && <button className="small-action pay-action" onClick={() => onSubscriptionAction(row, 'renew-request')}>Request renewal</button>}
+        </div>;
+      }
+      return <select className="row-select" value="" aria-label="Subscription action" onChange={(event) => { if (event.target.value) onSubscriptionAction(row, event.target.value); }}><option value="">Actions</option>{row.status === 'active' && row.plan?.allowPause && <option value="pause">Pause</option>}{row.status === 'paused' && <option value="resume">Resume</option>}{['draft', 'confirmed'].includes(row.status) && <option value="activate">Activate</option>}{(row.status === 'expired' || (row.status === 'active' && row.plan?.allowEarlyClose)) && <option value="close">Close</option>}{['closed', 'expired'].includes(row.status) && row.plan?.allowRenewal && <option value="renew">Renew</option>}</select>;
     }
     if (page === 'invoices' && canManage && row.outstanding > 0 && row.status !== 'cancelled') return <button className="small-action pay-action" onClick={() => onPayment(row)}>Record payment</button>;
     if (page === 'quotations' && canManage && ['sent', 'draft'].includes(row.status)) return <div className="row-actions"><button className="small-action" onClick={() => onAction(`/quotations/${row._id}/status`, { status: 'accepted' }, 'Quote accepted and subscription created.')}>Accept &amp; convert</button><button className="small-action reject-action" onClick={() => onAction(`/quotations/${row._id}/status`, { status: 'rejected' }, 'Quotation rejected.')}>Reject</button></div>;
@@ -521,7 +576,9 @@ function ListPage({ config, rows, busy, query, setQuery, role, page, onAction, o
     return null;
   };
   if (busy) return <div className="panel table-panel"><div className="loading-panel"><span className="spinner" /> Loading records…</div></div>;
-  return <section className="panel table-panel">
+  return <div className="list-page-stack">
+  {page === 'subscriptions' && <CustomerRequestsPanel requests={requestRows} customer={customer} canReview={canReviewRequests} onReview={onReviewRequest} />}
+  <section className="panel table-panel">
     <div className="table-toolbar"><div className="table-count">{rows.length} {rows.length === 1 ? 'record' : 'records'}</div><label className="table-search"><Search size={15} /><input placeholder={`Search ${config.title.toLowerCase()}…`} value={query} onChange={(event) => setQuery(event.target.value)} /><kbd>⌘ K</kbd></label></div>
     {rows.length ? <div className="table-scroll"><table><thead><tr>{config.columns.map(([, label]) => <th key={label}>{label}</th>)}{hasActionColumn && <th className="actions-head">Action</th>}</tr></thead><tbody>
       {rows.map((row) => <tr key={row._id}>{config.columns.map(([path, , type]) => {
@@ -532,6 +589,29 @@ function ListPage({ config, rows, busy, query, setQuery, role, page, onAction, o
       })}{hasActionColumn && <td className="row-action-cell">{actions(row)}</td>}</tr>)}
     </tbody></table></div> : <EmptyState title={query ? 'No matching records' : `No ${config.title.toLowerCase()} yet`} description={query ? 'Try another search term.' : page === 'subscriptions' ? 'Subscriptions will appear once a plan is started.' : page === 'invoices' ? 'Invoices are created when subscriptions are billed.' : page === 'payments' ? 'Recorded payments will appear here.' : page === 'plans' ? 'Available plans will appear here.' : 'New records will appear here when they are created.'} />}
     <div className="table-footer"><span>Showing {rows.length} {rows.length === 1 ? 'record' : 'records'}</span><span>SubSight records update as changes are saved.</span></div>
+  </section></div>;
+}
+
+function CustomerRequestsPanel({ requests, customer, canReview, onReview }) {
+  const pendingCount = requests.filter(({ request }) => request.status === 'pending').length;
+  return <section className="panel request-panel">
+    <div className="panel-heading request-heading"><div><h2>{customer ? 'My requests' : 'Customer requests'}</h2><p>{customer ? 'Track decisions on your subscription requests.' : 'Review pause, cancellation and renewal requests from customers.'}</p></div>{canReview && <span className="request-count">{pendingCount} pending</span>}</div>
+    {!requests.length
+      ? <EmptyState title={customer ? 'No subscription requests' : 'No customer requests yet'} description={customer ? 'Requests you submit will appear here with their review status.' : 'Customer pause, cancellation and renewal requests will appear here.'} compact />
+      : <div className="table-scroll"><table className="requests-table"><thead><tr><th>Subscription</th><th>Customer</th><th>Email</th><th>Plan</th><th>Request</th><th>Requested</th><th>Status</th>{canReview && <th>Review</th>}</tr></thead><tbody>
+        {requests.map(({ subscription, request }) => <tr key={request._id}>
+          <td className="request-number">{subscription.number}</td>
+          <td>{subscription.customer?.name || '—'}</td>
+          <td>{subscription.customer?.email || '—'}</td>
+          <td>{subscription.plan?.name || '—'}</td>
+          <td>{request.type === 'cancel' ? 'Cancellation' : titleCase(request.type)}</td>
+          <td>{date(request.requestedAt)}</td>
+          <td><Status value={request.status} /></td>
+          {canReview && <td>{request.status === 'pending'
+            ? <div className="row-actions"><button className="small-action pay-action" onClick={() => onReview({ subscription, request, decision: 'approved' })}>Approve</button><button className="small-action reject-action" onClick={() => onReview({ subscription, request, decision: 'rejected' })}>Reject</button></div>
+            : <span className="reviewed-note">{request.reviewedBy?.name ? `By ${request.reviewedBy.name} · ` : ''}{request.reviewedAt ? date(request.reviewedAt) : 'Processed'}</span>}</td>}
+        </tr>)}
+      </tbody></table></div>}
   </section>;
 }
 
