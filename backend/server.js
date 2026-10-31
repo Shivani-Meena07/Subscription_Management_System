@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import authRoutes from './routes/authRoutes.js';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -15,11 +16,16 @@ import { Discount, Invoice, Payment, Plan, Product, Quotation, Subscription, Tax
 import { addPeriod, escapeSearch, makeNumber, pageResult, passwordValid, quantityFor, round } from './utils.js';
 import { recordPayment } from './payments.js';
 
+require('dotenv').config();
+
 const app = express();
 app.use(helmet());
 app.use(cors({ origin: process.env.CLIENT_ORIGIN?.split(',') ?? 'http://localhost:5173' }));
 app.use(express.json({ limit: '1mb' }));
 app.use('/api/auth', rateLimit({ windowMs: 15 * 60 * 1000, limit: 50, standardHeaders: true, legacyHeaders: false }));
+
+app.use(express.json());
+app.use('/api/auth', authRoutes);
 
 const asyncRoute = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const objectId = (value) => mongoose.isObjectIdOrHexString(value);
