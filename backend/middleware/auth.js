@@ -1,4 +1,5 @@
 import jwt from 'jsonwebtoken';
+import mongoose from 'mongoose';
 import { User } from '../models.js';
 
 export async function authenticate(req, res, next) {
@@ -8,6 +9,7 @@ export async function authenticate(req, res, next) {
     const payload = jwt.verify(token, process.env.JWT_SECRET);
     const user = await User.findById(payload.sub).select('-password');
     if (!user || !user.active) return res.status(401).json({ message: 'Your account is unavailable.' });
+    if ((payload.ver ?? 0) !== (user.tokenVersion || 0)) return res.status(401).json({ message: 'Your session has expired. Sign in again.' });
     req.user = user;
     next();
   } catch (error) {
