@@ -6,7 +6,8 @@ import {
   FileText, LayoutDashboard, LogOut, Menu, Plus, Search, Settings2, ShieldCheck,
   Sparkles, Tag, UserRoundCog, Users, X
 } from 'lucide-react';
-import { request } from './api';
+import { request } from './api'
+import Landing from './Landing.jsx';
 
 const RevenueChart = lazy(() => import('./RevenueChart.jsx'));
 const chartMonths = Array.from({ length: 6 }, (_, index) => {
@@ -633,6 +634,7 @@ function ProfilePanel({ user, onSave }) {
 
 function AppFrame() {
   const [user, setUser] = useState(null);
+  const [showLanding, setShowLanding] = useState(true);
   const [checking, setChecking] = useState(Boolean(localStorage.getItem('subsight-token')));
   const location = useLocation();
   useEffect(() => {
@@ -648,6 +650,7 @@ function AppFrame() {
     navigate('/', { replace: true });
   }
   if (checking) return <div className="initial-loader"><span className="spinner" /> Connecting to SubSight…</div>;
+  if (!user && showLanding) return <Landing onGetStarted={() => setShowLanding(false)} onSignIn={() => setShowLanding(false)} />; 
   if (!user) return <AuthPage onLogin={setUser} />;
   return <Workspace key={user.id} user={user} onLogout={logout} />;
 }
