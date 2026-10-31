@@ -7,7 +7,7 @@ import {
   Sparkles, Tag, UserRoundCog, Users, X
 } from 'lucide-react';
 import { request } from './api'
-import Landing from './Landing.jsx';
+import Landing from './Landing (1).jsx';
 
 const RevenueChart = lazy(() => import('./RevenueChart.jsx'));
 const chartMonths = Array.from({ length: 6 }, (_, index) => {

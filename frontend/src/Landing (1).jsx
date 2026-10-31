@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { ArrowUpRight, CalendarClock, CreditCard, Users } from 'lucide-react';
-import './Landing.css';
+import './Landing (1).css';
 
 const months = Array.from({ length: 6 }, (_, i) => {
   const d = new Date();

@@ -913,6 +913,10 @@ export { app };
 
 async function startServer() {
   try {
+    if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
+      throw new Error('PORT must be a valid TCP port between 1 and 65535.');
+    }
+
     if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32 || process.env.JWT_SECRET.startsWith('replace-with-')) {
       throw new Error('Set JWT_SECRET to a private random value of at least 32 characters in backend/.env.');
     }
@@ -923,6 +927,13 @@ async function startServer() {
 
     await connectDB();
 
+    await new Promise((resolve, reject) => {
+      const listeningServer = app.listen(PORT, '127.0.0.1', () => resolve(listeningServer));
+      listeningServer.once('error', reject);
+    });
+
+    console.log(`SubSight API running on http://127.0.0.1:${PORT}`);
+
     cron.schedule('0 2 * * *', async () => {
       try {
         console.info('Scheduled billing run:', await generateDueInvoices());
@@ -930,13 +941,14 @@ async function startServer() {
         console.error('Scheduled billing run failed:', error);
       }
     });
-
-    app.listen(PORT, () => {
-      console.log(`SubSight API running on http://localhost:${PORT}`);
-    });
   } catch (error) {
     console.error('Server startup failed:', error.message);
-    process.exit(1);
+    try {
+      await mongoose.disconnect();
+    } catch (disconnectError) {
+      console.error('MongoDB cleanup after startup failure failed:', disconnectError.message);
+    }
+    process.exitCode = 1;
   }
 }
 
