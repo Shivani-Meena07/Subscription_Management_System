@@ -615,7 +615,7 @@ export async function startServer() {
   await syncPaymentHistory();
   console.log('Connected to MongoDB');
   const server = await new Promise((resolve, reject) => {
-    const listening = app.listen(port, process.env.HOST || '127.0.0.1', () => resolve(listening));
+    const listening = app.listen(port, process.env.HOST || '0.0.0.0', () => resolve(listening));
     listening.once('error', reject);
   });
   const billingTask = cron.schedule('0 2 * * *', async () => {
@@ -627,7 +627,7 @@ export async function startServer() {
     catch (error) { console.error('Payment history synchronization failed:', error.message); }
   }, { noOverlap: true });
   server.once('close', () => { billingTask.destroy(); paymentTask.destroy(); });
-  console.log(`SubSight API listening on http://${process.env.HOST || '127.0.0.1'}:${server.address().port}`);
+  console.log(`SubSight API listening on http://${process.env.HOST || '0.0.0.0'}:${server.address().port}`);
   return server;
 }
 

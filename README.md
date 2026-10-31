@@ -95,6 +95,16 @@ SubSight uses a client-server architecture with a React-based frontend and an Ex
 
 The backend manages authentication, access control, subscription operations, invoice generation, payment records, and financial calculations.
 
+```mermaid
+flowchart LR
+    UI[React interface] --> API[Express API]
+    API --> AUTH[Authentication and validation]
+    AUTH --> RULES[Subscription and billing rules]
+    RULES --> DB[(MongoDB)]
+    DB --> RESPONSE[JSON response]
+    RESPONSE --> UI
+```
+
 A shared billing service handles both scheduled invoice generation and manual billing requests.
 
 ## Billing & Calculation Logic
@@ -170,7 +180,7 @@ Configuration in `backend/.env`:
 | `MONGODB_URI` | MongoDB connection string |
 | `JWT_SECRET` | Private authentication secret (minimum 32 characters) |
 | `ADMIN_PASSWORD` | Initial administrator password |
-| `HOST` | Listening address; defaults to `127.0.0.1` |
+| `HOST` | Local setup uses `127.0.0.1`; without an explicit value the server binds to `0.0.0.0` for hosted deployments |
 | `BILLING_TIMEZONE` | Daily billing timezone; defaults to `Asia/Kolkata` |
 | `SMTP_*` | SMTP configuration for password reset emails |
 
@@ -250,11 +260,11 @@ The UI generates a `requestKey` for each payment submission and retains it for r
 
 ## Production Build
 
-Build `frontend` with `npm run build`, then start the backend with `NODE_ENV=production`. It serves the built UI and React route fallback from the same origin. Set `HOST=0.0.0.0` only when the application should listen beyond the local machine; configure HTTPS and deployment-specific network access on your hosting platform. Keep `.env` private.
+Build `frontend` with `npm run build`, then start the backend with `NODE_ENV=production`. It serves the built UI and React route fallback from the same origin. Hosted deployments, including Render, bind to `0.0.0.0` when `HOST` is not set and respect the platform's `PORT`. Local setup explicitly uses `127.0.0.1`. Configure HTTPS and deployment-specific network access on your hosting platform. Keep `.env` private.
 
 This completes the repository's local MVP workflows. Real automatic payment collection, payment-provider webhooks and refunds need a payment provider and credentials; this application records payments manually. Password reset email delivery is implemented through Nodemailer but requires valid `SMTP_*` configuration. No live gateway charge or external email delivery has been simulated as a successful production integration.
 
-For the implementation review and verification details, see [completion notes](docs/COMPLETION.md).
+The completed workflows are verified with 54 backend tests, frontend lint and production builds, and isolated browser checks covering quotation conversion, request approval, partial payments, report exports and customer access.
 
 ---
 
